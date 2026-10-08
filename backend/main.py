@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import asyncio
+import argparse
 import requests
 from typing import List, Dict, Any
 
@@ -22,6 +23,8 @@ import config
 
 USER_DATA_DIR = config.USER_DATA_DIR
 OUTPUT_DIR = config.MEDIA_OUTPUT_DIR
+# Automatic synchronization interval: 2 minutes
+SYNC_INTERVAL_SECONDS = 120
 
 # A valid session renders almost immediately, so this probe stays short: a
 # logged-out run should reach the QR prompt quickly rather than stalling silently.
@@ -130,7 +133,7 @@ def save_group_outputs(group_name: str, data: List[Dict[str, Any]]) -> None:
         print(" ✅ All attachments downloaded successfully.")
 
 
-async def main() -> None:
+async def main(auto: bool = False) -> None:
     """Launches the browser context directly to WhatsApp Web using stability user-agent parameters."""
     setup_logging()
     print("🚀 Starting Production WhatsApp Data Extraction Service...")
@@ -206,29 +209,60 @@ async def main() -> None:
 
         target_groups = getattr(config, "TARGET_GROUPS", ["Stock"])
 
-        for group_name in target_groups:
-            print(f"\n" + "-"*50)
-            print(f" 🎯 Processing Target Chat Panel: '{group_name}'")
-            print(f"-"*50)
+        while True:
+            for group_name in target_groups:
+                print("\n" + "-" * 50)
+                print(f" 🎯 Processing Target Chat Panel: '{group_name}'")
+                print("-" * 50)
 
-            opened = await scraper.open_group(group_name)
-            if opened:
-                group_messages = await scraper.scrape_active_chat(group_name)
-                if group_messages:
-                    save_group_outputs(group_name, group_messages)
+                opened = await scraper.open_group(group_name)
+
+                if opened:
+                    group_messages = await scraper.scrape_active_chat(group_name)
+
+                    if group_messages:
+                        save_group_outputs(group_name, group_messages)
+                    else:
+                        print(
+                            f" ℹ️ No workspace logs matched date "
+                            f"configurations for '{group_name}'."
+                        )
                 else:
-                    print(f" ℹ️ No workspace logs matched date configurations for '{group_name}'.")
-            else:
-                print(f" ❌ Skipping '{group_name}' (Could not expand chat pane selectors).")
+                    print(
+                        f" ❌ Skipping '{group_name}' "
+                        f"(Could not expand chat pane selectors)."
+                    )
 
-            await asyncio.sleep(2)
+                await asyncio.sleep(2)
+
+            # Manual mode: synchronize once and exit
+            if not auto:
+                break
+
+            # Automatic mode: wait 2 minutes and repeat
+            print(
+                f"\n⏳ Waiting {SYNC_INTERVAL_SECONDS} "
+                f"seconds before next sync..."
+            )
+            await asyncio.sleep(SYNC_INTERVAL_SECONDS)
 
         print("\n 🎉 Extraction process finished. Shutting down browser context safely...")
         await context.close()
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="WhatsApp to Zoho CRM synchronization"
+    )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="Enable automatic synchronization every 2 minutes"
+    )
+
+    args = parser.parse_args()
+
     try:
-        asyncio.run(main())
+        asyncio.run(main(auto=args.auto))
     except KeyboardInterrupt:
         print("\n 🛑 Execution stopped by user request.")
