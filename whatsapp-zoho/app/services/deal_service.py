@@ -169,6 +169,7 @@ def analyze_commercial_message(
         r"\b(\d+(?:\.\d+)?)\s*MT\b",
         r"\b(\d+(?:\.\d+)?)\s*tons?\b",
         r"\b(\d+(?:\.\d+)?)\s*tonnes?\b",
+        r"\b(\d+(?:\.\d+)?)\s*shares?\b",
     ]
 
     for pattern in quantity_patterns:
@@ -231,12 +232,20 @@ def analyze_commercial_message(
 
     for item in known_commodities:
 
-        if item.lower() in lower_text:
+        if re.search(r"\b" + re.escape(item) + r"\b", lower_text, re.IGNORECASE):
 
             commodity = item
 
             break
 
+    # Extract explicitly labeled stock symbols.
+    stock_match = re.search(
+        r"\bStock\s+Symbol\s*:\s*([A-Z]{1,5}(?:\.[A-Z])?)\b",
+        normalized_text,
+        re.IGNORECASE,
+    )
+    if stock_match:
+        commodity = stock_match.group(1).upper()
     # --------------------------------------------------------
     # 5. Structured Transaction Evidence
     # --------------------------------------------------------

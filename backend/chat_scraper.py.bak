@@ -427,7 +427,7 @@ class WhatsAppScraperAsync:
         try:
             main_container = self.page.locator('#main').first
             if await main_container.is_visible():
-                pass  # Avoid clicking inside the conversation
+                await main_container.click()
                 await asyncio.sleep(0.5)
             else:
                 return []
