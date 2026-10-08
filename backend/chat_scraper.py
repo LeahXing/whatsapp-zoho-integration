@@ -1,0 +1,619 @@
+"""
+Main Crawler Engine Module.
+Coordinates text parsing, media downloading handlers, and maps elements with strict date filtering.
+"""
+
+import asyncio
+import uuid
+from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
+from typing import List, Dict, Set, Any, Optional
+from playwright.async_api import ElementHandle, Page, TimeoutError as PlaywrightTimeoutError
+import config
+
+# System placeholders that carry no real message content and should not be exported.
+UNWANTED_BODY_MARKERS = ("this message was deleted",)
+
+# Header of the conversation currently open in the main pane. The pipeline must
+# confirm the right chat is open here *before* scrolling anything, otherwise a
+# mis-click would scrape an unrelated chat while still labelling every record
+# with the requested group name.
+CONVERSATION_HEADER_SELECTOR = '[data-testid="conversation-info-header"]'
+# WhatsApp Web reopens a chat at the last-read position, so a previous run leaves
+# the message pane scrolled up into history. Resetting to the newest message first
+# is what makes a sweep start from a consistent place instead of silently missing
+# every recent message.
+# The element that actually scrolls the message history. `#main div.copyable-area`
+# is NOT scrollable - its scrollHeight equals its clientHeight - so scrolling it is
+# a silent no-op. This is the scroller the browser reports as genuinely scrollable.
+MESSAGE_PANE_SELECTOR = '[data-testid="conversation-panel-messages"]'
+
+SCROLL_TO_LATEST_JS = r"""() => {
+    const pane = document.querySelector('[data-testid="conversation-panel-messages"]');
+    if (!pane) return null;
+    pane.scrollTop = pane.scrollHeight;
+    return { top: pane.scrollTop, height: pane.scrollHeight, client: pane.clientHeight };
+}"""
+
+SCROLL_UP_JS = r"""() => {
+    const pane = document.querySelector('[data-testid="conversation-panel-messages"]');
+    if (!pane) return null;
+    pane.scrollTop = pane.scrollTop - 750;
+    return { top: pane.scrollTop, height: pane.scrollHeight };
+}"""
+CONVERSATION_TITLE_SELECTOR = '[data-testid="conversation-info-header-chat-title"]'
+CHAT_SUBTITLE_SELECTOR = '[data-testid="chat-subtitle"]'
+GROUP_CALL_SELECTOR = '[aria-label="Group video call"]'
+
+# Clean local imports from modular split logic files
+from text_parser import WhatsAppTextParser
+from media_downloader import WhatsAppMediaDownloader
+from database_mapper import WhatsAppDatabaseMapper
+
+SchemaMessage = Dict[str, Any]
+
+# WhatsApp renders a day divider ("24/9/2026", "Yesterday", "Saturday") as a
+# sibling of the message wrappers, interleaved in order. It is the only
+# authoritative date source for media rows, which render a bare clock time and
+# no date. Rows are nested, so the divider is found by walking previous siblings
+# of the wrapper that directly contains the row.
+DAY_DIVIDER_JS = r"""(row) => {
+    let node = row.parentElement, container = null;
+    while (node) {
+        if (node.querySelectorAll('div[role="row"]').length > 1) { container = node; break; }
+        node = node.parentElement;
+    }
+    if (!container) return '';
+
+    let wrapper = row;
+    while (wrapper.parentElement && wrapper.parentElement !== container) {
+        wrapper = wrapper.parentElement;
+    }
+    if (wrapper.parentElement !== container) return '';
+
+    let sib = wrapper.previousElementSibling;
+    while (sib) {
+        if (!sib.querySelector('div[role="row"]')) {
+            const t = (sib.innerText || '').trim();
+            if (t) return t;
+        }
+        sib = sib.previousElementSibling;
+    }
+    return '';
+}"""
+
+# Media rows carry neither `data-pre-plain-text` nor `div.copyable-text`, so the
+# sender and time are read out of the row's own markup instead. The sender is
+# either an aria-label ending in ":" (WhatsApp's "You:") or the first line of the
+# row text; the time is the last clock/date-looking leaf span.
+ROW_METADATA_JS = r"""(row) => {
+    let sender = '';
+    const labelled = Array.from(row.querySelectorAll('[aria-label]'))
+        .map(e => e.getAttribute('aria-label') || '')
+        .find(a => a.endsWith(':'));
+    if (labelled) sender = labelled.slice(0, -1).trim();
+
+    const stamps = Array.from(row.querySelectorAll('span'))
+        .map(e => (e.textContent || '').trim())
+        .filter(t => /^\d{1,2}:\d{2}(\s*[ap]m)?$/i.test(t) || /^\d{1,2}[/.]\d{1,2}[/.]\d{2,4}$/.test(t));
+    const time = stamps.length ? stamps[stamps.length - 1] : '';
+
+    if (!sender) {
+        const first = (row.innerText || '').split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
+        const looksLikeName = first.length > 0 && first.length <= 40
+            && !/\.(pdf|docx?|xlsx?|pptx?|zip|txt|csv|jpe?g|png|mp4|mp3|webp)$/i.test(first)
+            && !/^\d{1,2}:\d{2}/.test(first)
+            && !/^\d{1,2}[/.]\d{1,2}[/.]\d{2,4}$/.test(first);
+        if (looksLikeName) sender = first;
+    }
+    return { sender: sender, time: time };
+}"""
+
+
+class WhatsAppScraperAsync:
+    """Manages automation scrolling flow constraints, targeted structural logic, and loops."""
+
+    def __init__(self, page: Page) -> None:
+        self.page = page
+        self.downloader = WhatsAppMediaDownloader(page)
+        self.current_user_name = ""
+
+    @staticmethod
+    async def _read_message_id(row: ElementHandle) -> Optional[str]:
+        """Reads the real WhatsApp message ID from inside a message row.
+
+        `data-id` is absent from the row itself but present one level in, on the
+        `div[data-testid="conv-msg-<ID>"]` wrapper. Reading it here is what makes
+        IDs stable across runs, and therefore what makes duplicate detection work.
+
+        Args:
+            row: A `#main` message row element.
+
+        Returns:
+            The real message ID, or None when the wrapper is missing.
+        """
+        try:
+            id_el = await row.query_selector('div[data-id]')
+            if id_el:
+                return await id_el.get_attribute('data-id')
+        except Exception:
+            return None
+        return None
+    @staticmethod
+    async def _is_outgoing_message(row: ElementHandle) -> bool:
+        """Check whether the message was sent by the logged-in account."""
+        try:
+            return await row.evaluate(
+                """(el) => Boolean(
+                    el.matches('.message-out') ||
+                    el.querySelector('.message-out') ||
+                    el.closest('.message-out')
+                )"""
+            )
+        except Exception:
+            return False
+
+    async def _recover_media_metadata(self, row: ElementHandle) -> Dict[str, str]:
+        """Recovers sender and time text from a row that has no `data-pre-plain-text`.
+
+        Media rows expose neither `data-pre-plain-text` nor `div.copyable-text`,
+        which is why attachment records previously fell back to "Unknown" and a
+        default timestamp. Detached rows are expected here (the list re-renders
+        around media), so failures return empty values rather than propagating.
+
+        Args:
+            row: A `#main` message row element.
+
+        Returns:
+            A dict with `sender` and `time` keys; either may be empty.
+        """
+        try:
+            result = await self.page.evaluate(ROW_METADATA_JS, row)
+            if isinstance(result, dict):
+                return {
+                    "sender": str(result.get("sender") or ""),
+                    "time": str(result.get("time") or ""),
+                }
+        except Exception as exc:
+            print(f"   ⚠️ Could not recover row metadata: {exc}")
+        return {"sender": "", "time": ""}
+
+    WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+    @classmethod
+    def _parse_day_divider(cls, divider_text: str) -> Optional[date]:
+        """Turns a WhatsApp day-divider label into a concrete date.
+
+        Formats observed live: an explicit date ("24/9/2026"), a weekday name
+        ("Saturday"), and "Yesterday". A weekday name means the most recent such
+        weekday *before* today, because WhatsApp labels the current day "Today"
+        rather than by name.
+
+        Args:
+            divider_text: Raw divider text, e.g. "24/9/2026" or "Yesterday".
+
+        Returns:
+            The date, or None when the text is not a recognised divider label.
+        """
+        text = divider_text.strip()
+        if not text:
+            return None
+
+        today = datetime.now().date()
+        lowered = text.lower()
+
+        if lowered == "today":
+            return today
+        if lowered == "yesterday":
+            return today - timedelta(days=1)
+
+        for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(text, fmt).date()
+            except ValueError:
+                continue
+
+        if lowered in cls.WEEKDAY_NAMES:
+            delta = (today.weekday() - cls.WEEKDAY_NAMES.index(lowered)) % 7
+            return today - timedelta(days=delta or 7)
+
+        return None
+
+    async def _read_day_divider(self, row: ElementHandle) -> str:
+        """Reads the day-divider text governing a message row, when rendered.
+
+        Dividers only exist for the loaded window, so an empty result is normal for
+        rows whose divider has scrolled out of the DOM.
+
+        Args:
+            row: A `#main` message row element.
+
+        Returns:
+            The divider text, or "" when none is found.
+        """
+        try:
+            return str(await self.page.evaluate(DAY_DIVIDER_JS, row) or "").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _parse_row_time(time_text: str, fallback_date: Optional[date] = None) -> Optional[datetime]:
+        """Builds a datetime from the time or date text rendered inside a media row.
+
+        WhatsApp renders an explicit date on older messages and a bare clock time
+        on recent ones - never both together. A bare time is therefore paired with
+        `fallback_date`, the nearest explicitly-dated row seen so far.
+
+        Deliberately NOT `datetime.now()`: that would label the same message
+        differently depending on which side of midnight the scrape ran, making the
+        output non-deterministic. Carrying the last observed date keeps re-runs
+        stable. The residual error is one day for a media message that is the first
+        of its day, where only the previous day's context is available.
+
+        Args:
+            time_text: The stamp text, e.g. "8:04 pm" or "28/09/2026".
+            fallback_date: Date to pair with a bare time; today is used if absent.
+
+        Returns:
+            The parsed datetime, or None when nothing matches.
+        """
+        cleaned = time_text.strip().upper().replace(".", "")
+
+        for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(cleaned, fmt)
+            except ValueError:
+                continue
+
+        for fmt in ("%I:%M %p", "%H:%M"):
+            try:
+                clock = datetime.strptime(cleaned, fmt)
+            except ValueError:
+                continue
+            return datetime.combine(fallback_date or datetime.now().date(), clock.time())
+
+        return None
+
+    @staticmethod
+    def _normalise_title(text: str) -> str:
+        """Normalises a chat title so comparison ignores case and whitespace quirks."""
+        return " ".join((text or "").replace("\u00a0", " ").split()).casefold()
+
+    async def _read_open_chat_title(self) -> str:
+        """Reads the title of the conversation currently open in the main pane.
+
+        Returns:
+            The title text, or "" when no conversation header can be read.
+        """
+        try:
+            title_el = await self.page.query_selector(CONVERSATION_TITLE_SELECTOR)
+            if title_el:
+                text = (await title_el.inner_text()).strip()
+                if text:
+                    return text
+                attribute = await title_el.get_attribute("title")
+                return (attribute or "").strip()
+        except Exception as exc:
+            print(f"   ⚠️ Could not read the conversation header: {exc}")
+        return ""
+
+    async def _scroll_to_latest(self, attempts: int = 5) -> None:
+        """Jumps the message pane to the newest message before a sweep begins.
+
+        Args:
+            attempts: How many times to force the pane to the bottom before giving up.
+        """
+        for _ in range(attempts):
+            try:
+                state = await self.page.evaluate(SCROLL_TO_LATEST_JS)
+            except Exception as exc:
+                print(f"   ⚠️ Could not jump to the newest message: {exc}")
+                return
+            if state is None:
+                return
+            if state["top"] + state["client"] >= state["height"] - 8:
+                print("    ⤓ Scrolled to the newest message.")
+                return
+            await asyncio.sleep(0.6)
+        print("    ⚠️ Could not confirm the pane reached the newest message.")
+
+    async def _is_group_conversation(self) -> bool:
+        """Detects whether the open conversation is a group, from its header.
+
+        Two independent signals are accepted: the participant subtitle
+        ("Kuntesh, APT, You") and the group call button.
+        """
+        try:
+            if await self.page.query_selector(CHAT_SUBTITLE_SELECTOR):
+                return True
+            header = await self.page.query_selector(
+                f"{CONVERSATION_HEADER_SELECTOR} {GROUP_CALL_SELECTOR}"
+            )
+            return header is not None
+        except Exception:
+            return False
+
+    async def verify_open_group(self, group_name: str) -> bool:
+        """Confirms the intended group is genuinely open before anything is scraped.
+
+        This is the gate the pipeline depends on: open the group, and *only then*
+        scroll. Without it, a mis-click or a same-named search result would let the
+        scraper sweep an unrelated chat while `build_schema_record` still stamped
+        every record with the requested group name - producing confident, wrong data.
+
+        Args:
+            group_name: The group that is expected to be open.
+
+        Returns:
+            True only when the open conversation's title matches and it is a group.
+        """
+        open_title = await self._read_open_chat_title()
+        if not open_title:
+            print("   ❌ No conversation header found; cannot confirm the open chat.")
+            return False
+
+        if self._normalise_title(open_title) != self._normalise_title(group_name):
+            print(f"   ❌ Open chat is '{open_title}', not the requested '{group_name}'.")
+            return False
+
+        if not await self._is_group_conversation():
+            print(f"   ❌ '{open_title}' is open but is not a group conversation.")
+            return False
+
+        return True
+
+    async def open_group(self, group_name: str) -> bool:
+        """Opens the target group and verifies it really is the one now displayed.
+
+        Selection is not trusted on its own: the search result is clicked and then
+        the conversation header is checked, so a wrong or missed click fails loudly
+        instead of silently scraping whatever chat happened to be open.
+
+        Args:
+            group_name: The group to open.
+
+        Returns:
+            True only when the requested group is confirmed open.
+        """
+        try:
+            print("🔍 Current page:", self.page.url, "| Title:", await self.page.title(), "| Chat list visible:", await self.page.locator("#pane-side").is_visible())
+            print("🔍 Search elements:", await self.page.locator('#side input, #side [role="textbox"], #side [contenteditable], #pane-side input').evaluate_all("(els) => els.map(e => e.outerHTML.slice(0, 300))"))
+            search_box = self.page.locator('input[aria-label="Search or start a new chat"]')
+            await search_box.click()
+
+            await self.page.keyboard.press("Control+A")
+            await self.page.keyboard.press("Backspace")
+            await asyncio.sleep(0.5)
+
+            await search_box.fill(group_name)
+            await asyncio.sleep(2)
+
+            group_title_locator = self.page.locator(f'span[title="{group_name}"]').first
+            await group_title_locator.wait_for(timeout=config.ELEMENT_TIMEOUT)
+            await group_title_locator.click()
+
+            # Give the main pane time to render the newly opened conversation.
+            await asyncio.sleep(2)
+
+            if not await self.verify_open_group(group_name):
+                print(f"   ❌ Refusing to scrape: '{group_name}' is not the open conversation.")
+                return False
+
+            print(f"   ✅ Verified group is open: '{group_name}'")
+            return True
+
+        except PlaywrightTimeoutError as e:
+            print(f"   ⚠️ Could not locate chat/chatbot session window: '{group_name}'")
+            print(f"   🔍 Playwright timeout details: {e}")
+            return False
+        except Exception as e:
+            print(f"   ❌ Error structural initialization step: {e}")
+            return False
+
+    async def scrape_active_chat(self, group_name: str = "Group") -> List[SchemaMessage]:
+        """Scrapes DOM tracking elements sequentially, filtering values to match targeted limits."""
+        raw_captured_records: List[Dict[str, Any]] = []
+        seen_keys: Set[str] = set()
+        processed_ids: Set[str] = set()
+        last_known_date: Optional[date] = None
+
+        start_raw = config.START_DATE.strip()
+        end_raw = config.END_DATE.strip()
+        start_dt: date = datetime.strptime(start_raw, "%Y-%m-%d").date()
+        end_dt: date = datetime.strptime(end_raw, "%Y-%m-%d").date()
+
+        max_scrolls = getattr(config, 'MAX_HISTORY_SCROLLS', 60)
+
+        try:
+            main_container = self.page.locator('#main').first
+            if await main_container.is_visible():
+                await main_container.click()
+                await asyncio.sleep(0.5)
+            else:
+                return []
+        except Exception:
+            return []
+
+        # Always begin from the newest message. Skipping this lets a previous run's
+        # scroll position leak into this one, so the sweep starts mid-history and
+        # quietly captures only old messages.
+        await self._scroll_to_latest()
+
+        print(f" 📜 Step 1: Sequential extraction matching date constraints ({start_raw})...")
+
+        empty_passes = 0
+
+        for _ in range(1, max_scrolls + 1):
+            if self.page.is_closed():
+                break
+
+            # Re-confirm the group is still the open chat before scrolling further.
+            # An empty read is inconclusive (transient DOM state) and only warns;
+            # a *different* title means the session genuinely drifted, which is
+            # worse than stopping, because the records would be mislabelled.
+            current_title = await self._read_open_chat_title()
+            if current_title and self._normalise_title(current_title) != self._normalise_title(group_name):
+                print(f"   ❌ Chat drifted to '{current_title}'; stopping scrape of '{group_name}'.")
+                break
+
+            try:
+                records_before_pass = len(raw_captured_records)
+                rows = await self.page.query_selector_all('#main div[role="row"]')
+                print(f"   🔍 DEBUG: Found {len(rows)} DOM rows in the currently rendered message pane.")
+                for debug_i, debug_row in enumerate(rows):
+                    try:
+                        debug_text = (await debug_row.inner_text()).replace("\n", " | ")
+                        debug_meta = await debug_row.get_attribute("data-pre-plain-text")
+                        debug_copyable = await debug_row.query_selector("div.copyable-text")
+
+                        if debug_copyable:
+                            debug_copyable_meta = await debug_copyable.get_attribute("data-pre-plain-text")
+                        else:
+                            debug_copyable_meta = None
+
+                        print(f"      ROW {debug_i}: {debug_text[:300]}")
+                        print(f"         row_meta      = {debug_meta!r}")
+                        print(f"         copyable_meta = {debug_copyable_meta!r}")
+                    except Exception:
+                        pass
+                reflowed = False
+                index = 0
+
+                while index < len(rows):
+                    row = rows[index]
+                    index += 1
+                    try:
+                        dom_id = await self._read_message_id(row)
+                        if dom_id and dom_id in processed_ids:
+                            continue
+                        msg_id = dom_id or f"msg_{uuid.uuid4().hex[:10]}"
+                        if dom_id:
+                            processed_ids.add(dom_id)
+
+                        row_meta = await row.get_attribute('data-pre-plain-text')
+                        text_el = await row.query_selector('div.copyable-text')
+                        # Skip group information rows, but preserve genuine media messages.
+                        if not text_el:
+                            row_text = (await row.inner_text()).strip()
+                            if "Add members" in row_text and "Invite to group via link" in row_text:
+                                print("   ⏭️ Skipping WhatsApp group information row")
+                                continue
+
+                        if text_el:
+                            raw_meta = await text_el.get_attribute('data-pre-plain-text') or row_meta
+                            body = await text_el.inner_text()
+                        else:
+                            raw_meta = row_meta
+                            body = await row.inner_text()
+
+                        body = body.strip()
+                        raw_timestamp, sender, msg_datetime = WhatsAppTextParser.parse_timestamp(raw_meta)
+
+                        # Media rows have no data-pre-plain-text, so recover the
+                        # sender and clock time from the row's own markup instead,
+                        # pairing a bare time with the nearest explicitly-dated row.
+                        if msg_datetime is not None:
+                            last_known_date = msg_datetime.date()
+                        else:
+                            recovered = await self._recover_media_metadata(row)
+                            sender = sender or recovered["sender"]
+                            # Normalize the logged-in user's sender name
+                            if self.current_user_name:
+                                if sender.strip().lower() == "you":
+                                    sender = self.current_user_name
+                                elif await self._is_outgoing_message(row):
+                                    sender = self.current_user_name
+                            print(
+                                f"   🔍 Sender verification: "
+                                f"resolved_sender={sender!r}, "
+                                f"logged_in_user={self.current_user_name!r}"
+                            )
+                            # The day divider is authoritative when rendered; the
+                            # carried date is only a fallback for rows whose divider
+                            # has scrolled out of the DOM.
+                            divider_date = self._parse_day_divider(await self._read_day_divider(row))
+                            msg_datetime = self._parse_row_time(
+                                recovered["time"], divider_date or last_known_date
+                            )
+                            if msg_datetime is not None:
+                                last_known_date = msg_datetime.date()
+
+                        clean_body = " ".join(part.strip() for part in body.splitlines() if part.strip())
+                        if any(marker in clean_body.lower() for marker in UNWANTED_BODY_MARKERS):
+                            continue
+                        msg_date = msg_datetime.date() if msg_datetime else None
+
+                        # Strict targeted calendar window constraint logic
+                        if msg_date is not None:
+                            if not (start_dt <= msg_date <= end_dt):
+                                continue
+
+                        # Delegate attachment download work to the split Media Downloader module
+                        media_type, media_name, file_path = await self.downloader.detect_and_download_attachments(
+                            row, group_name, msg_id
+                        )
+
+                        if media_type != "chat" and not clean_body:
+                            clean_body = f"[{media_type.upper()} ATTACHMENT]"
+
+                        # A row with neither text nor an attachment carries no information.
+                        if media_type == "chat" and not clean_body:
+                            continue
+
+                        dedup_key = f"{raw_timestamp}_{sender}_{clean_body[:30]}_{media_type}"
+                        if dedup_key in seen_keys:
+                            continue
+
+                        seen_keys.add(dedup_key)
+                        unix_ts = int(msg_datetime.timestamp()) if msg_datetime else int(datetime.now().timestamp())
+                        dubai_datetime = (
+                            msg_datetime.astimezone(ZoneInfo("Asia/Dubai"))
+                            if msg_datetime else None
+                        )
+
+                        date_str = dubai_datetime.strftime("%Y-%m-%d") if dubai_datetime else start_raw
+                        time_str_ampm = dubai_datetime.strftime("%I:%M:%S %p") if dubai_datetime else "12:00:00 AM"
+
+                        # Delegate structure payload generation to the split Database Mapper module
+                        schema_record = WhatsAppDatabaseMapper.build_schema_record(
+                            group_name=group_name, msg_id=msg_id, sender=sender, clean_body=clean_body,
+                            media_type=media_type, unix_ts=unix_ts, date_str=date_str, time_str_ampm=time_str_ampm,
+                            file_path=file_path
+                        )
+                        schema_record["_sort_dt"] = msg_datetime or datetime.min
+                        raw_captured_records.append(schema_record)
+
+                        if media_type != "chat" and not reflowed:
+                            # Opening a document re-renders the message list and
+                            # detaches every remaining handle, so refresh them once
+                            # per pass. Already-processed rows are skipped by ID.
+                            reflowed = True
+                            rows = await self.page.query_selector_all('#main div[role="row"]')
+                            index = 0
+                    except Exception:
+                        continue
+
+                # Stop once history is exhausted rather than grinding through the
+                # full MAX_HISTORY_SCROLLS budget on a chat that has no more to give.
+                if len(raw_captured_records) == records_before_pass:
+                    empty_passes += 1
+                    if raw_captured_records and empty_passes >= 2:
+                        print(" ℹ️ No new records in two consecutive passes; ending scroll early.")
+                        break
+                else:
+                    empty_passes = 0
+
+                # Scroll the message history upward via the real scroller.
+                await self.page.evaluate(SCROLL_UP_JS)
+                await asyncio.sleep(1.0)
+
+            except Exception:
+                break
+
+        # Step 2: Final chronological formatting structure calculations
+        raw_captured_records.sort(key=lambda x: x["_sort_dt"])
+        final_messages: List[SchemaMessage] = []
+        for item in raw_captured_records:
+            final_messages.append({k: v for k, v in item.items() if k != "_sort_dt"})
+
+        return final_messages
