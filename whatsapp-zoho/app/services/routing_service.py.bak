@@ -1,10 +1,8 @@
-import threading
 from typing import Optional
 
 from app.schemas.message_schema import WhatsAppMessageRequest
 
 from app.repositories.zoho_repository import (
-    ZohoDuplicateError,
     find_contact_by_whatsapp_id,
     find_lead_by_whatsapp_id,
     create_lead,
@@ -14,18 +12,6 @@ from app.repositories.zoho_repository import (
     convert_lead_to_contact,
     update_whatsapp_message,
 )
-
-
-# One lock per WhatsApp sender (within this Python process).
-_sender_locks = {}
-_sender_locks_guard = threading.Lock()
-
-
-def get_sender_lock(whatsapp_id: str):
-    with _sender_locks_guard:
-        if whatsapp_id not in _sender_locks:
-            _sender_locks[whatsapp_id] = threading.Lock()
-        return _sender_locks[whatsapp_id]
 
 
 # =========================================================
@@ -229,21 +215,6 @@ def route_whatsapp_sender(
     whatsapp_message_record_id: str,
     analysis: dict
 ) -> dict:
-    whatsapp_id = message.senderIdentity.whatsappId
-
-    with get_sender_lock(whatsapp_id):
-        return _route_whatsapp_sender_locked(
-            message,
-            whatsapp_message_record_id,
-            analysis
-        )
-
-
-def _route_whatsapp_sender_locked(
-    message: WhatsAppMessageRequest,
-    whatsapp_message_record_id: str,
-    analysis: dict
-) -> dict:
 
     whatsapp_id = message.senderIdentity.whatsappId
 
@@ -430,41 +401,9 @@ def _route_whatsapp_sender_locked(
             message
         )
 
-        try:
-            contact_result = create_contact(
-                contact_record
-            )
-        except ZohoDuplicateError:
-            existing_contact = find_contact_by_whatsapp_id(
-                whatsapp_id
-            )
-
-            if existing_contact is None:
-                raise RuntimeError(
-                    "Zoho reported a duplicate Contact, "
-                    "but the existing Contact could not be found."
-                )
-
-            append_history_to_contact(
-                existing_contact,
-                message
-            )
-
-            contact_id = existing_contact["id"]
-
-            update_whatsapp_message(
-                whatsapp_message_record_id,
-                {"Contact": contact_id}
-            )
-
-            return {
-                "person_type": "contact",
-                "person_id": contact_id,
-                "action": "CONTACT_DUPLICATE_RECOVERED",
-                "created": False,
-                "converted": False,
-                "source_lead_id": None,
-            }
+        contact_result = create_contact(
+            contact_record
+        )
 
         # Zoho create response:
         #
@@ -501,41 +440,9 @@ def _route_whatsapp_sender_locked(
         message
     )
 
-    try:
-        lead_result = create_lead(
-            lead_record
-        )
-    except ZohoDuplicateError:
-        existing_lead = find_lead_by_whatsapp_id(
-            whatsapp_id
-        )
-
-        if existing_lead is None:
-            raise RuntimeError(
-                "Zoho reported a duplicate Lead, "
-                "but the existing Lead could not be found."
-            )
-
-        append_history_to_lead(
-            existing_lead,
-            message
-        )
-
-        lead_id = existing_lead["id"]
-
-        update_whatsapp_message(
-            whatsapp_message_record_id,
-            {"Lead": lead_id}
-        )
-
-        return {
-            "person_type": "lead",
-            "person_id": lead_id,
-            "action": "LEAD_DUPLICATE_RECOVERED",
-            "created": False,
-            "converted": False,
-            "source_lead_id": None,
-        }
+    lead_result = create_lead(
+        lead_record
+    )
 
     # Zoho create response:
     #

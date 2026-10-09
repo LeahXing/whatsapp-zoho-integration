@@ -400,10 +400,6 @@ def search_zoho_records(
 # Generic Zoho Record Creation
 # ============================================================
 
-class ZohoDuplicateError(RuntimeError):
-    """Zoho rejected record creation because of a duplicate value."""
-
-
 def create_zoho_record(
     module_name: str,
     record_data: dict
@@ -471,11 +467,6 @@ def create_zoho_record(
     record_result = records[0]
 
     if record_result.get("status") != "success":
-        if record_result.get("code") == "DUPLICATE_DATA":
-            raise ZohoDuplicateError(
-                f"Duplicate record in {module_name}: {record_result}"
-            )
-
         raise RuntimeError(
             f"Zoho failed to create record in "
             f"{module_name}: {record_result}"
