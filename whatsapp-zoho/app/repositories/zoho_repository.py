@@ -216,6 +216,12 @@ def find_whatsapp_message_by_message_id(
     if not records:
         return None
 
+    if len(records) > 1:
+        raise ValueError(
+            "AMBIGUOUS_WHATSAPP_MESSAGE_ID: "
+            "Multiple Zoho records match the same Message_ID."
+        )
+
     return records[0]
 
 # ============================================================

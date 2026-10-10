@@ -105,7 +105,10 @@ def save_group_outputs(group_name: str, data: List[Dict[str, Any]]) -> None:
         print(f" ❌ Failed to save JSON for {group_name}: {e}")
 
     # 2. Path Mapping & API Dispatch to WhatsApp Zoho Integration API
-    send_records_to_zoho_api(data)
+    if os.environ.get("WHATSAPP_DRY_RUN") == "1":
+        print("DRY RUN: Skipping Zoho API dispatch.")
+    else:
+        send_records_to_zoho_api(data)
 
     # 3. Save Styled Excel Worksheet
     excel_filename = os.path.join(OUTPUT_DIR, f"{base_filename}.xlsx")

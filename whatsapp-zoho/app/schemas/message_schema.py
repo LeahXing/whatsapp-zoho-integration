@@ -24,6 +24,11 @@ class MessageMeta(BaseModel):
     isForwarded: bool = False
 
 
+# Optional WhatsApp reply relationship
+class ThreadContext(BaseModel):
+    replyToMessageId: Optional[str] = None
+
+
 # ============================================================
 # Sender Identity
 # ============================================================
@@ -77,6 +82,7 @@ class WhatsAppMessageRequest(BaseModel):
     # Message
     messageId: str
     messageMeta: Optional[MessageMeta] = None
+    threadContext: Optional[ThreadContext] = None
 
     # Sender
     senderIdentity: SenderIdentity

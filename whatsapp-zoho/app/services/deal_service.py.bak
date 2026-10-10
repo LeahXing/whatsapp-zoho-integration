@@ -5,7 +5,6 @@ from app.schemas.message_schema import WhatsAppMessageRequest
 
 from app.repositories.zoho_repository import (
     find_active_deals_by_contact,
-    find_whatsapp_message_by_message_id,
     create_deal,
     update_deal,
     update_whatsapp_message,
@@ -156,11 +155,7 @@ def analyze_commercial_message(
     ]
 
     has_commercial_keyword = any(
-        re.search(
-            r"\b" + re.escape(keyword) + r"\b",
-            lower_text,
-            re.IGNORECASE,
-        )
+        keyword in lower_text
         for keyword in commercial_keywords
     )
 
@@ -280,7 +275,10 @@ def analyze_commercial_message(
     # 6. Final Commercial Intent
     # --------------------------------------------------------
 
-    is_commercial = has_commercial_keyword
+    is_commercial = (
+        has_commercial_keyword
+        or has_transaction_data
+    )
 
     # --------------------------------------------------------
     # 7. Qualification
@@ -304,88 +302,12 @@ def analyze_commercial_message(
     # 8. Return Analysis
     # --------------------------------------------------------
 
-    # --------------------------------------------------------
-    # 8. Classify Message Type
-    # --------------------------------------------------------
-
-    message_type = "UNKNOWN"
-
-    news_patterns = [
-        r"\bprices?\s+(?:increased|decreased|rose|fell|jumped)\b",
-        r"\bmarket\s+(?:news|update|report)\b",
-        r"\b(?:profit|revenue|sensex|nifty)\b",
-    ]
-
-    enquiry_patterns = [
-        r"\b(?:looking to buy|want to buy|need to buy)\b",
-        r"\b(?:looking to sell|want to sell)\b",
-        r"\b(?:require|looking for)\b",
-    ]
-
-    quote_patterns = [
-        r"\b(?:we offer|we can offer|our quote|quoted price)\b",
-        r"\b(?:can supply|offering)\b",
-    ]
-
-    negotiation_patterns = [
-        r"\b(?:best price|reduce the price|discount)\b",
-        r"\b(?:can you do|counteroffer|counter offer)\b",
-    ]
-
-    confirmation_patterns = [
-        r"\b(?:deal confirmed|order confirmed)\b",
-        r"\b(?:agreed|let's proceed|we accept)\b",
-    ]
-
-    def matches(patterns):
-        return any(
-            re.search(pattern, lower_text, re.IGNORECASE)
-            for pattern in patterns
-        )
-
-    if matches(news_patterns):
-        message_type = "MARKET_NEWS"
-    elif matches(confirmation_patterns):
-        message_type = "CONFIRMATION"
-    elif matches(negotiation_patterns):
-        message_type = "NEGOTIATION"
-    elif matches(quote_patterns):
-        message_type = "QUOTE"
-    elif matches(enquiry_patterns):
-        message_type = (
-            "ENQUIRY" if commodity else "INCOMPLETE_ENQUIRY"
-        )
-
-    # --------------------------------------------------------
-    # 9. Align commercial flags with message type
-    # --------------------------------------------------------
-
-    lifecycle_types = {
-        "INCOMPLETE_ENQUIRY",
-        "ENQUIRY",
-        "QUOTE",
-        "NEGOTIATION",
-        "CONFIRMATION",
-    }
-
-    if message_type == "MARKET_NEWS":
-        is_commercial = False
-        is_qualified = False
-    elif message_type in lifecycle_types:
-        is_commercial = True
-        is_qualified = commodity is not None
-
-    # --------------------------------------------------------
-    # 10. Return Analysis
-    # --------------------------------------------------------
-
     return {
         "is_commercial": is_commercial,
         "is_qualified": is_qualified,
         "commodity": commodity,
         "quantity": quantity,
         "price": price,
-        "message_type": message_type,
     }
 
 
@@ -414,98 +336,40 @@ def find_matching_deal(
     commodity: Optional[str],
 ) -> Optional[dict]:
     """
-    Match an existing active Deal by commodity.
+    Attempt to match the incoming message to an existing
+    active Deal.
 
-    Return a Deal only when exactly one match exists.
-    Raise ValueError when multiple Deals match.
+    Current rule:
+
+        Match by Commodity.
+
+    Later this can use:
+
+        commodity
+        quantity
+        price
+        recent conversation
+        semantic/LLM analysis
     """
 
     if not commodity:
         return None
 
-    matches = [
-        deal
-        for deal in active_deals
+    for deal in active_deals:
+
+        deal_commodity = deal.get(
+            "Commodity"
+        )
+
         if (
-            deal.get("Commodity")
-            and str(deal["Commodity"]).strip().lower()
-            == commodity.strip().lower()
-        )
-    ]
+            deal_commodity
+            and deal_commodity.lower()
+            == commodity.lower()
+        ):
 
-    if len(matches) == 1:
-        return matches[0]
-
-    if len(matches) > 1:
-        raise ValueError(
-            "AMBIGUOUS_DEAL_MATCH: Multiple active Deals "
-            f"match commodity '{commodity}'. "
-            "Manual Deal selection is required."
-        )
+            return deal
 
     return None
-
-
-
-def find_reply_matching_deal(
-    message: WhatsAppMessageRequest,
-    contact_id: str,
-    active_deals: list,
-) -> Optional[dict]:
-    """
-    Resolve a WhatsApp reply to an existing active Deal.
-
-    Never guess when the original message or Deal
-    cannot be verified.
-    """
-    thread = message.threadContext
-    reply_id = thread.replyToMessageId if thread else None
-
-    if not reply_id:
-        return None
-
-    original = find_whatsapp_message_by_message_id(reply_id)
-
-    if not original:
-        raise ValueError(
-            "UNRESOLVED_REPLY: Original WhatsApp message not found."
-        )
-
-    if str(original.get("Group_ID")) != str(message.chatId):
-        raise ValueError(
-            "UNRESOLVED_REPLY: Original message belongs to another group."
-        )
-
-    deal_lookup = original.get("Deal")
-    deal_id = (
-        deal_lookup.get("id")
-        if isinstance(deal_lookup, dict)
-        else None
-    )
-
-    if not deal_id:
-        raise ValueError(
-            "UNRESOLVED_REPLY: Original message has no linked Deal."
-        )
-
-    matches = [
-        deal for deal in active_deals
-        if (
-            str(deal.get("id")) == str(deal_id)
-            and deal.get("WhatsApp_Active_Deal") is True
-            and isinstance(deal.get("Contact_Name"), dict)
-            and str(deal["Contact_Name"].get("id")) == str(contact_id)
-            and str(deal.get("WhatsApp_Group_ID")) == str(message.chatId)
-        )
-    ]
-
-    if len(matches) != 1:
-        raise ValueError(
-            "UNRESOLVED_REPLY: Referenced Deal is not uniquely verified "
-            "as active and belonging to this Contact and group."
-        )
-
-    return matches[0]
 
 
 # ============================================================
@@ -699,44 +563,6 @@ def process_deal(
     # 3. No commercial intent
     # --------------------------------------------------------
 
-    # Prioritize explicit WhatsApp replies.
-    thread = message.threadContext
-    reply_id = thread.replyToMessageId if thread else None
-
-    if reply_id:
-        active_deals = find_active_deals_by_contact(contact_id)
-
-        try:
-            matching_deal = find_reply_matching_deal(
-                message,
-                contact_id,
-                active_deals,
-            )
-        except ValueError as exc:
-            return {
-                "deal_action": "MANUAL_REVIEW",
-                "reason": str(exc),
-                "deal_id": None,
-                "analysis": analysis,
-            }
-
-        if matching_deal:
-            deal_id = matching_deal["id"]
-
-            append_history_to_deal(matching_deal, message)
-
-            update_whatsapp_message(
-                whatsapp_message_record_id,
-                {"Deal": {"id": deal_id}},
-            )
-
-            return {
-                "deal_action": "LINK_EXISTING",
-                "deal_id": deal_id,
-                "match_method": "WHATSAPP_REPLY",
-                "analysis": analysis,
-            }
-
     if not analysis.get(
         "is_commercial"
     ):
@@ -783,21 +609,14 @@ def process_deal(
     # 6. Try to Match Existing Deal
     # --------------------------------------------------------
 
-    try:
-        matching_deal = find_matching_deal(
+    matching_deal = (
+        find_matching_deal(
             active_deals,
-            analysis.get("commodity"),
+            analysis.get(
+                "commodity"
+            ),
         )
-    except ValueError as exc:
-        if "AMBIGUOUS_DEAL_MATCH" not in str(exc):
-            raise
-
-        return {
-            "deal_action": "MANUAL_REVIEW",
-            "reason": str(exc),
-            "deal_id": None,
-            "analysis": analysis,
-        }
+    )
 
     if matching_deal:
 
@@ -831,24 +650,7 @@ def process_deal(
         }
 
     # --------------------------------------------------------
-    # 7. Prevent new Deals from follow-up messages
-    # --------------------------------------------------------
-
-    message_type = analysis.get("message_type")
-
-    if message_type in {"NEGOTIATION", "CONFIRMATION"}:
-        return {
-            "deal_action": "MANUAL_REVIEW",
-            "reason": (
-                f"{message_type} message has no matching active Deal. "
-                "Manual Deal selection is required."
-            ),
-            "deal_id": None,
-            "analysis": analysis,
-        }
-
-    # --------------------------------------------------------
-    # 8. Create New Deal
+    # 7. Create New Deal
     # --------------------------------------------------------
 
     deal_data = build_deal_record(

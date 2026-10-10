@@ -140,6 +140,44 @@ class WhatsAppScraperAsync:
             return None
         return None
     @staticmethod
+    async def _read_reply_reference(row: ElementHandle) -> Optional[Dict[str, str]]:
+        """Extract quoted sender and text without guessing the original ID."""
+        try:
+            return await row.evaluate(
+                """(el) => {
+                    const quote = el.querySelector(
+                        '[data-testid="quoted-message"]'
+                    );
+                    if (!quote) return null;
+
+                    const textElement = quote.querySelector(
+                        '[data-testid="selectable-text"]'
+                    );
+                    const quotedText = textElement?.innerText?.trim() || '';
+
+                    const senderElement = Array.from(
+                        quote.querySelectorAll('span')
+                    ).find(span =>
+                        span !== textElement &&
+                        !span.contains(textElement) &&
+                        span.textContent?.trim()
+                    );
+
+                    const quotedSender =
+                        senderElement?.textContent?.trim() || '';
+
+                    if (!quotedText || !quotedSender) return null;
+
+                    return {
+                        quotedSender: quotedSender,
+                        quotedText: quotedText
+                    };
+                }"""
+            )
+        except Exception:
+            return None
+
+    @staticmethod
     async def _is_outgoing_message(row: ElementHandle) -> bool:
         """Check whether the message was sent by the logged-in account."""
         try:
@@ -410,6 +448,54 @@ class WhatsAppScraperAsync:
             print(f"   ❌ Error structural initialization step: {e}")
             return False
 
+    def _resolve_reply_references(
+        self, raw_captured_records: List[SchemaMessage]
+    ) -> List[SchemaMessage]:
+        """Resolve uniquely matching quoted messages without browser access."""
+        raw_captured_records.sort(key=lambda x: x["_sort_dt"])
+        final_messages: List[SchemaMessage] = []
+
+        for item in raw_captured_records:
+            quote = item.get("_reply_quote")
+
+            if quote:
+                quoted_sender = quote["quotedSender"].strip().casefold()
+                quoted_text = quote["quotedText"].strip()
+
+                if quoted_sender == "you" and self.current_user_name:
+                    quoted_sender = self.current_user_name.strip().casefold()
+
+                matches = [
+                    original
+                    for original in raw_captured_records
+                    if original is not item
+                    and (
+                        original["_sort_dt"] < item["_sort_dt"]
+                        or (
+                            original["_sort_dt"] == item["_sort_dt"]
+                            and raw_captured_records.index(original)
+                                < raw_captured_records.index(item)
+                        )
+                    )
+                    and original["senderIdentity"]["pushName"].strip().casefold()
+                        == quoted_sender
+                    and original["messageContent"]["textContent"].strip()
+                        == quoted_text
+                    and original.get("messageId")
+                ]
+
+                if len(matches) == 1:
+                    item["threadContext"] = {
+                        "replyToMessageId": matches[0]["messageId"]
+                    }
+
+            final_messages.append({
+                k: v for k, v in item.items()
+                if k not in ("_sort_dt", "_reply_quote")
+            })
+
+        return final_messages
+
     async def scrape_active_chat(self, group_name: str = "Group") -> List[SchemaMessage]:
         """Scrapes DOM tracking elements sequentially, filtering values to match targeted limits."""
         raw_captured_records: List[Dict[str, Any]] = []
@@ -506,7 +592,39 @@ class WhatsAppScraperAsync:
                             raw_meta = row_meta
                             body = await row.inner_text()
 
+                        # For replies, exclude the quoted original message.
+                        # Keep only the new message's own text.
+                        reply_quote = await self._read_reply_reference(row)
+                        if reply_quote:
+                            body = await row.evaluate(
+                                """(el) => {
+                                    const container =
+                                        el.querySelector('div.copyable-text') || el;
+                                    const clone = container.cloneNode(true);
+
+                                    clone.querySelectorAll(
+                                        '[data-testid="quoted-message"]'
+                                    ).forEach(node => node.remove());
+
+                                    clone.querySelectorAll(
+                                        '[data-testid="msg-meta"], '
+                                        + '[data-testid="message-meta"], '
+                                        + '[data-testid="msg-time"]'
+                                    ).forEach(node => node.remove());
+
+                                    return clone.innerText || clone.textContent || '';
+                                }"""
+                            )
+
                         body = body.strip()
+                        if reply_quote:
+                            import re
+                            body = re.sub(
+                                r'\s*\d{1,2}:\d{2}\s*[AP]M\s*$',
+                                '',
+                                body,
+                                flags=re.IGNORECASE
+                            ).strip()
                         raw_timestamp, sender, msg_datetime = WhatsAppTextParser.parse_timestamp(raw_meta)
 
                         # Media rows have no data-pre-plain-text, so recover the
@@ -580,6 +698,10 @@ class WhatsAppScraperAsync:
                             media_type=media_type, unix_ts=unix_ts, date_str=date_str, time_str_ampm=time_str_ampm,
                             file_path=file_path
                         )
+                        reply_info = await self._read_reply_reference(row)
+                        if reply_info:
+                            schema_record["_reply_quote"] = reply_info
+
                         schema_record["_sort_dt"] = msg_datetime or datetime.min
                         raw_captured_records.append(schema_record)
 
@@ -612,8 +734,4 @@ class WhatsAppScraperAsync:
 
         # Step 2: Final chronological formatting structure calculations
         raw_captured_records.sort(key=lambda x: x["_sort_dt"])
-        final_messages: List[SchemaMessage] = []
-        for item in raw_captured_records:
-            final_messages.append({k: v for k, v in item.items() if k != "_sort_dt"})
-
-        return final_messages
+        return self._resolve_reply_references(raw_captured_records)

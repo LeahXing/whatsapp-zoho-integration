@@ -50,6 +50,13 @@ def build_zoho_message_record(
         "Message_ID": message.messageId,
         "Group_ID": message.chatId,
 
+        # Original WhatsApp message referenced by this reply.
+        "Reply_To_Message_ID": (
+            message.threadContext.replyToMessageId
+            if message.threadContext
+            else None
+        ),
+
         # ----------------------------------------------------
         # Group Information
         # ----------------------------------------------------

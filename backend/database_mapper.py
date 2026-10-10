@@ -21,7 +21,7 @@ class WhatsAppDatabaseMapper:
     ) -> Dict[str, Any]:
         """Maps data items to structured payload constraints (WhatsAppGroupChatMessageLog Specifications)."""
         return {
-            "chatId": f"{abs(hash(group_name)) % 10**10}@g.us",
+            "chatId": f"{int(hashlib.sha256(group_name.encode()).hexdigest(), 16) % 10**10}@g.us",
             "groupContext": {
                 "currentName": group_name, 
                 "activeMemberCount": 0
