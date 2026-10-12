@@ -7,6 +7,7 @@ from app.repositories.zoho_repository import (
     ZohoDuplicateError,
     find_contact_by_whatsapp_id,
     find_lead_by_whatsapp_id,
+    find_whatsapp_messages_by_whatsapp_id,
     create_lead,
     create_contact,
     update_lead,
@@ -77,15 +78,40 @@ def append_conversation_history(
     existing_history: Optional[str],
     new_entry: str
 ) -> str:
-    """
-    Append a new WhatsApp conversation entry without
-    overwriting the existing conversation history.
-    """
+    from app.services.conversation_history import (
+        append_conversation_history as safe_append
+    )
+    return safe_append(existing_history, new_entry)
 
-    if not existing_history:
-        return new_entry
 
-    return f"{existing_history.rstrip()}\n\n{new_entry}"
+def build_safe_chronological_history(
+    existing_history: str,
+    message: WhatsAppMessageRequest
+) -> str:
+    from app.services.conversation_history import (
+        format_sorted_message_history
+    )
+
+    new_entry = format_conversation_entry(message)
+    fallback = append_conversation_history(existing_history, new_entry)
+
+    try:
+        records = find_whatsapp_messages_by_whatsapp_id(
+            message.senderIdentity.whatsappId
+        )
+        formatted = format_sorted_message_history(records)
+
+        # Never discard historical text absent from structured records.
+        if existing_history and existing_history not in formatted:
+            return fallback
+
+        # Never omit the incoming message.
+        if new_entry not in formatted:
+            return fallback
+
+        return formatted
+    except Exception:
+        return fallback
 
 
 # =========================================================
@@ -170,9 +196,9 @@ def append_history_to_lead(
 
     new_entry = format_conversation_entry(message)
 
-    updated_history = append_conversation_history(
+    updated_history = build_safe_chronological_history(
         existing_history,
-        new_entry
+        message
     )
 
     update_lead(
@@ -205,9 +231,9 @@ def append_history_to_contact(
 
     new_entry = format_conversation_entry(message)
 
-    updated_history = append_conversation_history(
+    updated_history = build_safe_chronological_history(
         existing_history,
-        new_entry
+        message
     )
 
     update_contact(

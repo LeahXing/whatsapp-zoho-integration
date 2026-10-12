@@ -287,6 +287,120 @@ def find_whatsapp_messages_by_sender_name(
         )
     )
 
+def find_whatsapp_messages_by_whatsapp_id(
+    whatsapp_id: str
+) -> list:
+    """
+    Retrieve all WhatsApp messages for a sender.
+
+    Read-only Zoho CRM operation.
+    Supports pagination and chronological sorting.
+    """
+
+    url = (
+        f"{ZOHO_API_DOMAIN}/crm/v8/"
+        f"{WHATSAPP_MESSAGES_MODULE}/search"
+    )
+
+    all_records = []
+    page = 1
+
+    while True:
+        params = {
+            "criteria": f"(WhatsApp_ID:equals:{whatsapp_id})",
+            "page": page,
+            "per_page": 200,
+        }
+
+        response = requests.get(
+            url,
+            headers=get_headers(),
+            params=params,
+            timeout=30
+        )
+
+        if response.status_code == 204:
+            break
+
+        if not response.ok:
+            raise RuntimeError(
+                f"WhatsApp message search failed: "
+                f"HTTP {response.status_code}: "
+                f"{response.text}"
+            )
+
+        result = response.json()
+        all_records.extend(result.get("data", []))
+
+        if not result.get("info", {}).get("more_records", False):
+            break
+
+        page += 1
+
+    return sorted(
+        all_records,
+        key=lambda record: (
+            int(record.get("Unix_Timestamp") or 0),
+            str(record.get("Message_ID") or "")
+        )
+    )
+
+def find_whatsapp_messages_by_deal_id(
+    deal_id: str
+) -> list:
+    """
+    Retrieve WhatsApp messages linked to one specific Deal.
+    Read-only operation; results are sorted chronologically.
+    """
+
+    url = (
+        f"{ZOHO_API_DOMAIN}/crm/v8/"
+        f"{WHATSAPP_MESSAGES_MODULE}/search"
+    )
+
+    all_records = []
+    page = 1
+
+    while True:
+        params = {
+            "criteria": f"(Deal:equals:{deal_id})",
+            "page": page,
+            "per_page": 200,
+        }
+
+        response = requests.get(
+            url,
+            headers=get_headers(),
+            params=params,
+            timeout=30,
+        )
+
+        if response.status_code == 204:
+            break
+
+        if not response.ok:
+            raise RuntimeError(
+                f"Deal message search failed: "
+                f"HTTP {response.status_code}: {response.text}"
+            )
+
+        result = response.json()
+        all_records.extend(result.get("data", []))
+
+        if not result.get("info", {}).get("more_records", False):
+            break
+
+        page += 1
+
+    return sorted(
+        all_records,
+        key=lambda record: (
+            int(record.get("Unix_Timestamp") or 0),
+            str(record.get("Message_ID") or ""),
+        ),
+    )
+
+
 # ============================================================
 # Create WhatsApp Message Record
 # ============================================================
