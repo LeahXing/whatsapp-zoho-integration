@@ -169,10 +169,23 @@ def analyze_commercial_message(
     quantity = None
 
     quantity_patterns = [
-        r"\b(\d+(?:\.\d+)?)\s*MT\b",
-        r"\b(\d+(?:\.\d+)?)\s*tons?\b",
-        r"\b(\d+(?:\.\d+)?)\s*tonnes?\b",
-        r"\b(\d+(?:\.\d+)?)\s*shares?\b",
+        # Weight
+        r"\b(\d+(?:\.\d+)?)\s*(?:MT|metric\s+tons?)\b",
+        r"\b(\d+(?:\.\d+)?)\s*(?:tons?|tonnes?)\b",
+        r"\b(\d+(?:\.\d+)?)\s*(?:kilograms?|kgs?)\b",
+        r"\b(\d+(?:\.\d+)?)\s*(?:grams?|g)\b",
+        r"\b(\d+(?:\.\d+)?)\s*(?:ounces?|oz)\b",
+        r"\b(\d+(?:\.\d+)?)\s*(?:pounds?|lbs?)\b",
+
+        # Stocks
+        r"\b(\d+(?:\.\d+)?)\s*(?:shares?|stocks?)\b",
+
+        # Volume
+        r"\b(\d+(?:\.\d+)?)\s*(?:barrels?|bbl)\b",
+        r"\b(\d+(?:\.\d+)?)\s*(?:liters?|litres?)\b",
+
+        # Other
+        r"\b(\d+(?:\.\d+)?)\s*(?:units?|lots?)\b",
     ]
 
     for pattern in quantity_patterns:
@@ -221,25 +234,75 @@ def analyze_commercial_message(
     # --------------------------------------------------------
     # 4. Commodity Extraction
     # --------------------------------------------------------
-
     known_commodities = [
-        "Urea",
-        "Wheat",
-        "Rice",
-        "Sugar",
-        "Corn",
-        "Soybean",
+        # Precious metals
+        "Gold", "Silver", "Platinum", "Palladium",
+
+        # Industrial metals
+        "Copper", "Aluminum", "Aluminium",
+        "Iron", "Iron Ore", "Steel", "Zinc",
+        "Nickel", "Tin", "Lithium", "Cobalt",
+
+        # Energy
+        "Crude Oil", "Brent Crude", "WTI",
+        "Natural Gas", "LNG", "Coal",
+        "Diesel", "Gasoline",
+
+        # Agriculture
+        "Wheat", "Rice", "Corn", "Maize",
+        "Soybean", "Soybeans", "Sugar",
+        "Cotton", "Coffee", "Cocoa",
+        "Palm Oil", "Sunflower Oil",
+
+        # Fertilizers
+        "Urea", "DAP", "MAP", "NPK",
+        "Potash", "Ammonium Nitrate",
+
+        # US stock names
+        "Apple", "Microsoft", "NVIDIA",
+        "Tesla", "Amazon", "Google",
+        "Alphabet", "Netflix", "Intel",
+        "Salesforce",
+
+        # US stock tickers
+        "AAPL", "MSFT", "NVDA", "TSLA",
+        "AMZN", "GOOGL", "GOOG", "NFLX",
+        "INTC", "CRM", "AMD", "CSCO",
+        "ORCL", "JPM", "BAC",
     ]
+
+    commodity_aliases = {
+        "aluminium": "Aluminum",
+        "maize": "Corn",
+        "soybeans": "Soybean",
+        "brent crude": "Crude Oil",
+
+        "apple": "AAPL",
+        "microsoft": "MSFT",
+        "nvidia": "NVDA",
+        "tesla": "TSLA",
+        "amazon": "AMZN",
+        "google": "GOOGL",
+        "alphabet": "GOOGL",
+        "netflix": "NFLX",
+        "intel": "INTC",
+        "salesforce": "CRM",
+    }
 
     commodity = None
 
-    for item in known_commodities:
-
-        if re.search(r"\b" + re.escape(item) + r"\b", lower_text, re.IGNORECASE):
-
-            commodity = item
-
+    for item in sorted(known_commodities, key=len, reverse=True):
+        if re.search(
+            r"\b" + re.escape(item) + r"\b",
+            normalized_text,
+            re.IGNORECASE,
+        ):
+            commodity = commodity_aliases.get(
+                item.lower(),
+                item,
+            )
             break
+    
 
     # Extract explicitly labeled stock symbols.
     stock_match = re.search(
