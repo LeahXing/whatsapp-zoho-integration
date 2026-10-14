@@ -57,7 +57,8 @@ def sync_whatsapp_note(
             "status": "reconciliation_required",
             "note_id": sync_state["note_id"],
         }
-
+    note_title = f"{group_name} | {sender_name} | {timestamp}"
+    note_content = message_text
     existing_notes = get_zoho_notes(
         module_name=module_name,
         record_id=record_id,
@@ -88,10 +89,23 @@ def sync_whatsapp_note(
                 "note_id": existing_note_id,
             }
 
-    # Clean Zoho Note format
-    note_title = f"{group_name} | {sender_name} | {timestamp}"
-    note_content = message_text
+    clean_matches = [
+        note for note in existing_notes
+        if note.get("Note_Title") == note_title
+        and note.get("Note_Content") == note_content
+    ]
 
+    if clean_matches:
+        return {
+            "status": "reconciliation_required",
+            "note_id": (
+                clean_matches[0].get("id")
+                if len(clean_matches) == 1
+                else None
+            ),
+        }
+
+    # Clean Zoho Note format
     # Atomically claim synchronization before creating the Note.
     claimed = claim_note_sync(
         message_id=message_id,
