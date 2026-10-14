@@ -10,6 +10,7 @@ from app.repositories.zoho_repository import (
 from app.storage.processing_state import (
     get_note_sync_state,
     save_note_sync_state,
+    claim_note_sync,
 )
 
 def sync_whatsapp_note(
@@ -91,14 +92,20 @@ def sync_whatsapp_note(
     note_title = f"{group_name} | {sender_name} | {timestamp}"
     note_content = message_text
 
-    # Record synchronization attempt before calling Zoho.
-    # If the API outcome is uncertain, do not blindly retry.
-    save_note_sync_state(
+    # Atomically claim synchronization before creating the Note.
+    claimed = claim_note_sync(
         message_id=message_id,
         module_name=module_name,
         record_id=record_id,
-        sync_status="pending",
     )
+
+    if not claimed:
+        # Another request may already be processing this message.
+        # Do not create another Zoho Note.
+        return {
+            "status": "reconciliation_required",
+            "note_id": None,
+        }
 
     result = create_zoho_note(
         module_name=module_name,

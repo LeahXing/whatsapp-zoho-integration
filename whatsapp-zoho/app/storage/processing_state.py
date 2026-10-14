@@ -186,3 +186,36 @@ def save_note_sync_state(
                 sync_status,
             ),
         )
+
+def claim_note_sync(
+    message_id: str,
+    module_name: str,
+    record_id: str,
+) -> bool:
+    """
+    Atomically claim Notes synchronization.
+
+    Returns True only when a new pending record
+    was successfully inserted.
+
+    Returns False if the message already has
+    a pending or completed synchronization.
+    """
+
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO whatsapp_note_sync (
+                message_id,
+                module_name,
+                record_id,
+                sync_status
+            )
+            VALUES (?, ?, ?, 'pending')
+            """,
+            (message_id, module_name, record_id),
+        )
+
+        return cursor.rowcount == 1
