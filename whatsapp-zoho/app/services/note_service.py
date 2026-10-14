@@ -7,6 +7,10 @@ from app.repositories.zoho_repository import (
     get_zoho_notes,
 )
 
+from app.storage.processing_state import (
+    get_note_sync_state,
+    save_note_sync_state,
+)
 
 def sync_whatsapp_note(
     module_name: str,
@@ -29,6 +33,29 @@ def sync_whatsapp_note(
 
     if not record_id:
         raise ValueError("record_id is required.")
+    
+    # Check whether this WhatsApp message has already
+    # been synchronized to this Zoho CRM record.
+    sync_state = get_note_sync_state(
+        message_id=message_id,
+        module_name=module_name,
+        record_id=record_id,
+    )
+
+    if sync_state and sync_state["sync_status"] == "completed":
+        return {
+            "status": "already_synced",
+            "note_id": sync_state["note_id"],
+        }
+
+    # An earlier request may have created a Zoho Note
+    # before its Note ID was saved locally.
+    # Do not automatically create another Note.
+    if sync_state and sync_state["sync_status"] == "pending":
+        return {
+            "status": "reconciliation_required",
+            "note_id": sync_state["note_id"],
+        }
 
     existing_notes = get_zoho_notes(
         module_name=module_name,
@@ -39,19 +66,38 @@ def sync_whatsapp_note(
 
     for note in existing_notes:
         if marker in (note.get("Note_Content") or ""):
+
+            existing_note_id = note.get("id")
+
+            if not existing_note_id:
+                raise ValueError(
+                    "Existing Zoho Note is missing its Note ID."
+                )
+
+            save_note_sync_state(
+                message_id=message_id,
+                module_name=module_name,
+                record_id=record_id,
+                note_id=existing_note_id,
+                sync_status="completed",
+            )
+
             return {
                 "status": "already_synced",
-                "note_id": note.get("id"),
+                "note_id": existing_note_id,
             }
 
-    note_title = f"WhatsApp | {group_name} | {timestamp}"
+    # Clean Zoho Note format
+    note_title = f"{group_name} | {sender_name} | {timestamp}"
+    note_content = message_text
 
-    note_content = (
-        f"Sender: {sender_name}\n"
-        f"Group: {group_name}\n"
-        f"Timestamp: {timestamp}\n\n"
-        f"Message:\n{message_text}\n\n"
-        f"{marker}"
+    # Record synchronization attempt before calling Zoho.
+    # If the API outcome is uncertain, do not blindly retry.
+    save_note_sync_state(
+        message_id=message_id,
+        module_name=module_name,
+        record_id=record_id,
+        sync_status="pending",
     )
 
     result = create_zoho_note(
@@ -61,7 +107,18 @@ def sync_whatsapp_note(
         note_content=note_content,
     )
 
+    # Save the Zoho Note ID after successful creation.
+    note_id = result["details"]["id"]
+
+    save_note_sync_state(
+        message_id=message_id,
+        module_name=module_name,
+        record_id=record_id,
+        note_id=note_id,
+        sync_status="completed",
+    )
+
     return {
         "status": "created",
-        "note_id": result["details"]["id"],
+        "note_id": note_id,
     }

@@ -21,7 +21,12 @@ message = WhatsAppMessageRequest(
 with (
     patch(
         "app.services.message_service.find_whatsapp_message_by_message_id",
-        return_value={"id": "EXISTING-MESSAGE-ID"},
+        return_value={
+            "id": "EXISTING-MESSAGE-ID",
+            "Deal": {
+                "id": "EXISTING-DEAL-ID"
+            },
+        },
     ),
     patch(
         "app.services.message_service.find_contact_by_whatsapp_id",
@@ -35,16 +40,25 @@ with (
     ) as create_message,
     patch(
         "app.services.message_service.sync_whatsapp_note",
-        side_effect=RuntimeError("Simulated Zoho Notes API failure"),
+        return_value={"status": "created", "note_id": "TEST-NOTE-ID"},
     ) as sync_note,
 ):
     result = process_whatsapp_message(message)
 
     assert result["status"] == "duplicate"
     print("DEBUG result:", result)
-    assert result["notes"]["status"] == "failed"
+    assert result["notes"]["status"] == "created"
     create_message.assert_not_called()
-    sync_note.assert_called_once()
+
+    assert result["deal_notes"]["status"] == "created"
+
+    assert sync_note.call_count == 2
+
+    assert sync_note.call_args_list[0].kwargs["module_name"] == "Contacts"
+    assert sync_note.call_args_list[0].kwargs["record_id"] == "EXISTING-CONTACT-ID"
+
+    assert sync_note.call_args_list[1].kwargs["module_name"] == "Deals"
+    assert sync_note.call_args_list[1].kwargs["record_id"] == "EXISTING-DEAL-ID"
 
     print("PASS: Existing message was not recreated.")
     print("PASS: Notes synchronization was retried.")

@@ -210,6 +210,16 @@ def retry_existing_message_notes(message, existing_message):
     """
 
     whatsapp_id = message.senderIdentity.whatsappId
+    # Retrieve the Deal already linked to this WhatsApp message.
+    # Do not create or search for another Deal.
+
+    deal_lookup = existing_message.get("Deal")
+
+    deal_id = (
+        deal_lookup.get("id")
+        if isinstance(deal_lookup, dict)
+        else None
+    )
 
     contact = find_contact_by_whatsapp_id(whatsapp_id)
     lead = None if contact else find_lead_by_whatsapp_id(whatsapp_id)
@@ -255,11 +265,40 @@ def retry_existing_message_notes(message, existing_message):
             "error": str(exc),
         }
 
+    # Retry Deal Notes only when the message has a linked Deal.
+    deal_notes_result = {"status": "no_deal"}
+
+    if deal_id:
+        try:
+            deal_notes_result = sync_whatsapp_note(
+                module_name="Deals",
+                record_id=deal_id,
+                message_id=message.messageId,
+                sender_name=message.senderIdentity.pushName or "Unknown",
+                group_name=(
+                    message.groupContext.currentName
+                    if message.groupContext
+                    else "Unknown Group"
+                ),
+                timestamp=f"{message.displayDate} {message.displayTime}",
+                message_text=(
+                    message.messageContent.textContent or ""
+                    if message.messageContent
+                    else ""
+                ),
+            )
+        except Exception as exc:
+            deal_notes_result = {
+                "status": "failed",
+                "error": str(exc),
+            }
+
     return {
         "status": "duplicate",
         "message_id": message.messageId,
         "zoho_message_record_id": existing_message.get("id"),
         "notes": notes_result,
+        "deal_notes": deal_notes_result,
     }
 
 # ============================================================
