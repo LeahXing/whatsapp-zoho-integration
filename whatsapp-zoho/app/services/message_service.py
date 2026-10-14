@@ -7,6 +7,8 @@ from app.schemas.message_schema import WhatsAppMessageRequest
 from app.repositories.zoho_repository import (
     find_whatsapp_message_by_message_id,
     create_whatsapp_message,
+    find_contact_by_whatsapp_id,
+    find_lead_by_whatsapp_id,
 )
 
 from app.services.routing_service import (
@@ -22,6 +24,9 @@ from app.services.media_service import (
     upload_media_to_zoho,
 )
 
+from app.services.note_service import (
+    sync_whatsapp_note,
+)
 
 # ============================================================
 # Build Zoho WhatsApp_Messages Record
@@ -194,6 +199,68 @@ def build_zoho_message_record(
         if value is not None
     }
 
+# ============================================================
+# Retry Notes for an Existing WhatsApp Message
+# ============================================================
+
+def retry_existing_message_notes(message, existing_message):
+    """
+    Retry Notes synchronization for a WhatsApp message
+    that already exists in Zoho CRM.
+    """
+
+    whatsapp_id = message.senderIdentity.whatsappId
+
+    contact = find_contact_by_whatsapp_id(whatsapp_id)
+    lead = None if contact else find_lead_by_whatsapp_id(whatsapp_id)
+
+    if contact:
+        module_name = "Contacts"
+        person_id = contact.get("id")
+    elif lead:
+        module_name = "Leads"
+        person_id = lead.get("id")
+    else:
+        return {
+            "status": "duplicate",
+            "message_id": message.messageId,
+            "zoho_message_record_id": existing_message.get("id"),
+            "notes": {
+                "status": "skipped",
+                "reason": "No matching Contact or Lead found.",
+            },
+        }
+
+    try:
+        notes_result = sync_whatsapp_note(
+            module_name=module_name,
+            record_id=person_id,
+            message_id=message.messageId,
+            sender_name=message.senderIdentity.pushName or "Unknown",
+            group_name=(
+                message.groupContext.currentName
+                if message.groupContext
+                else "Unknown Group"
+            ),
+            timestamp=f"{message.displayDate} {message.displayTime}",
+            message_text=(
+                message.messageContent.textContent or ""
+                if message.messageContent
+                else ""
+            ),
+        )
+    except Exception as exc:
+        notes_result = {
+            "status": "failed",
+            "error": str(exc),
+        }
+
+    return {
+        "status": "duplicate",
+        "message_id": message.messageId,
+        "zoho_message_record_id": existing_message.get("id"),
+        "notes": notes_result,
+    }
 
 # ============================================================
 # Process Incoming WhatsApp Message
@@ -213,7 +280,8 @@ def process_whatsapp_message(
         4. Route sender to Contact / Lead.
         5. Process Deal using the same analysis.
         6. Process media attachments.
-        7. Return complete processing result.
+        7. Synchronize WhatsApp message to Zoho Notes.
+        8. Return complete processing result.
 
     Important:
 
@@ -232,17 +300,10 @@ def process_whatsapp_message(
     )
 
     if existing_message:
-
-        return {
-            "status": "duplicate",
-            "message": (
-                "Message already exists in Zoho CRM."
-            ),
-            "message_id": message.messageId,
-            "zoho_message_record_id": (
-                existing_message.get("id")
-            ),
-        }
+        return retry_existing_message_notes(
+            message=message,
+            existing_message=existing_message,
+    )         
 
     # --------------------------------------------------------
     # 2. Build WhatsApp_Messages Record
@@ -275,12 +336,10 @@ def process_whatsapp_message(
             )
 
             if existing_message:
-                return {
-                    "status": "duplicate",
-                    "message": "Message already exists in Zoho CRM.",
-                    "message_id": message.messageId,
-                    "zoho_message_record_id": existing_message.get("id"),
-                }
+                return retry_existing_message_notes(
+                    message=message,
+                    existing_message=existing_message,
+                )
 
         raise
 
@@ -414,7 +473,74 @@ def process_whatsapp_message(
     )
 
     # --------------------------------------------------------
-    # 8. Return Complete Processing Result
+    # 8. Synchronize WhatsApp Message to Zoho Notes
+    # --------------------------------------------------------
+
+    try:
+        notes_result = sync_whatsapp_note(
+            module_name=(
+                "Contacts" if person_type == "contact"
+                else "Leads"
+            ),
+            record_id=person_id,
+            message_id=message.messageId,
+            sender_name=message.senderIdentity.pushName or "Unknown",
+            group_name=(
+                message.groupContext.currentName
+                if message.groupContext
+                else "Unknown Group"
+            ),
+            timestamp=f"{message.displayDate} {message.displayTime}",
+            message_text=(
+                message.messageContent.textContent or ""
+                if message.messageContent
+                else ""
+            ),
+        )
+
+    except Exception as exc:
+        notes_result = {
+            "status": "failed",
+            "error": str(exc),
+        }
+
+    # --------------------------------------------------------
+    # 8A. Synchronize WhatsApp Message to Deal Notes
+    # --------------------------------------------------------
+
+    deal_notes_result = {"status": "no_deal"}
+
+    if deal_id:
+        try:
+            deal_notes_result = sync_whatsapp_note(
+                module_name="Deals",
+                record_id=deal_id,
+                message_id=message.messageId,
+                sender_name=(
+                    message.senderIdentity.pushName or "Unknown"
+                ),
+                group_name=(
+                    message.groupContext.currentName
+                    if message.groupContext
+                    else "Unknown Group"
+                ),
+                timestamp=(
+                    f"{message.displayDate} {message.displayTime}"
+                ),
+                message_text=(
+                    message.messageContent.textContent or ""
+                    if message.messageContent
+                    else ""
+                ),
+            )
+        except Exception as exc:
+            deal_notes_result = {
+                "status": "failed",
+                "error": str(exc),
+            }
+
+    # --------------------------------------------------------
+    # 9. Return Complete Processing Result
     # --------------------------------------------------------
 
     return {
@@ -456,4 +582,8 @@ def process_whatsapp_message(
         "deal": deal_result,
 
         "media": media_result,
+
+        "notes": notes_result,
+
+        "deal_notes": deal_notes_result,
     }

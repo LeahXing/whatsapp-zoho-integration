@@ -600,12 +600,6 @@ def build_deal_record(
         else None
     )
 
-    conversation_entry = (
-        format_conversation_entry(
-            message
-        )
-    )
-
     # Deal Name must exist in Zoho.
 
     deal_name_parts = [
@@ -640,12 +634,6 @@ def build_deal_record(
             group_name
         ),
 
-        # Initialize Deal conversation history.
-
-        "WhatsApp_Conversation_History": (
-            conversation_entry
-        ),
-
         "WhatsApp_Active_Deal": True,
     }
 
@@ -657,7 +645,7 @@ def build_deal_record(
 
 
 # ============================================================
-# Append History to Existing Deal
+# Update Existing Deal Group Information
 # ============================================================
 
 def append_history_to_deal(
@@ -665,66 +653,15 @@ def append_history_to_deal(
     message: WhatsAppMessageRequest
 ) -> None:
     """
-    Update one Deal's history in chronological order when safe.
-    Preserve existing history if structured records are incomplete.
+    Update Deal group information without writing
+    conversation history to the old CRM field.
     """
 
     deal_id = deal["id"]
-    existing_history = (
-        deal.get("WhatsApp_Conversation_History") or ""
-    )
-    new_entry = format_conversation_entry(message)
-
-    from app.services.conversation_history import (
-        append_conversation_history as safe_append,
-        format_sorted_message_history,
-    )
-
-    fallback = safe_append(existing_history, new_entry)
-
-    try:
-        records = find_whatsapp_messages_by_deal_id(deal_id)
-
-        # The current message is linked to the Deal after this
-        # history update, so include it explicitly for sorting.
-        current_record = {
-            "Message_ID": message.messageId,
-            "Unix_Timestamp": (
-                message.messageMeta.unixTimestamp
-                if message.messageMeta else 0
-            ),
-            "Sender_Name": message.senderIdentity.pushName,
-            "WhatsApp_ID": message.senderIdentity.whatsappId,
-            "Display_Date": message.displayDate,
-            "Display_Time": message.displayTime,
-            "Message": (
-                message.messageContent.textContent
-                if message.messageContent else ""
-            ),
-        }
-
-        current_id = str(current_record["Message_ID"])
-        records = [
-            r for r in records
-            if str(r.get("Message_ID") or "") != current_id
-        ]
-        records.append(current_record)
-
-        formatted = format_sorted_message_history(records)
-
-        if existing_history and existing_history not in formatted:
-            updated_history = fallback
-        elif new_entry not in formatted:
-            updated_history = fallback
-        else:
-            updated_history = formatted
-    except Exception:
-        updated_history = fallback
 
     update_deal(
         deal_id,
         {
-            "WhatsApp_Conversation_History": updated_history,
             "WhatsApp_Group_ID": message.chatId,
             "WhatsApp_Group_Name": (
                 message.groupContext.currentName
@@ -733,7 +670,6 @@ def append_history_to_deal(
             ),
         }
     )
-
 
 # ============================================================
 # Process Deal Routing

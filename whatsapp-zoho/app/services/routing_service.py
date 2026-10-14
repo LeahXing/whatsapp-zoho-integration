@@ -128,15 +128,16 @@ def build_lead_record(
         or "Unknown WhatsApp User"
     )
 
-    conversation_entry = format_conversation_entry(message)
-
     return {
         "Last_Name": sender_name,
         "WhatsApp_ID": message.senderIdentity.whatsappId,
         "WhatsApp_Group_ID": message.chatId,
-        "WhatsApp_Group_Name": message.groupContext.currentName,
+        "WhatsApp_Group_Name": (
+            message.groupContext.currentName
+            if message.groupContext
+            else None
+        ),
         "Lead_Source": "WhatsApp",
-        "WhatsApp_Conversation_History": conversation_entry,
     }
 
 
@@ -154,14 +155,15 @@ def build_contact_record(
         or "Unknown WhatsApp User"
     )
 
-    conversation_entry = format_conversation_entry(message)
-
     return {
         "Last_Name": sender_name,
         "WhatsApp_ID": message.senderIdentity.whatsappId,
         "WhatsApp_Group_ID": message.chatId,
-        "WhatsApp_Group_Name": message.groupContext.currentName,
-        "WhatsApp_Conversation_History": conversation_entry,
+        "WhatsApp_Group_Name": (
+            message.groupContext.currentName
+            if message.groupContext
+            else None
+        ),
     }
 
 
@@ -172,45 +174,29 @@ def build_contact_record(
 def append_history_to_lead(
     lead: dict,
     message: WhatsAppMessageRequest
-) -> str:
+) -> None:
     """
-    Append a new WhatsApp conversation entry without
-    overwriting the existing Lead conversation history.
+    Update Lead group information without writing
+    conversation history to the old CRM field.
 
-    Returns:
-        Complete updated conversation history.
-
-    The returned history is important when a qualified
-    Lead is converted into a Contact. Zoho does not
-    automatically transfer our custom WhatsApp conversation
-    history field during Lead conversion, so routing_service
-    explicitly copies this complete history to the Contact.
+    WhatsApp messages are synchronized to Zoho Notes
+    by message_service.py.
     """
 
     lead_id = lead["id"]
 
-    existing_history = (
-        lead.get("WhatsApp_Conversation_History")
-        or ""
-    )
-
-    new_entry = format_conversation_entry(message)
-
-    updated_history = build_safe_chronological_history(
-        existing_history,
-        message
-    )
-
     update_lead(
         lead_id,
         {
-            "WhatsApp_Conversation_History": updated_history,
             "WhatsApp_Group_ID": message.chatId,
-            "WhatsApp_Group_Name": message.groupContext.currentName,
+            "WhatsApp_Group_Name": (
+                message.groupContext.currentName
+                if message.groupContext
+                else None
+            ),
         }
     )
-
-    return updated_history
+   
 
 
 # =========================================================
@@ -221,27 +207,25 @@ def append_history_to_contact(
     contact: dict,
     message: WhatsAppMessageRequest
 ) -> None:
+    """
+    Update Contact group information without writing
+    conversation history to the old CRM field.
+
+    WhatsApp messages are synchronized to Zoho Notes
+    by message_service.py.
+    """
 
     contact_id = contact["id"]
-
-    existing_history = (
-        contact.get("WhatsApp_Conversation_History")
-        or ""
-    )
-
-    new_entry = format_conversation_entry(message)
-
-    updated_history = build_safe_chronological_history(
-        existing_history,
-        message
-    )
 
     update_contact(
         contact_id,
         {
-            "WhatsApp_Conversation_History": updated_history,
             "WhatsApp_Group_ID": message.chatId,
-            "WhatsApp_Group_Name": message.groupContext.currentName,
+            "WhatsApp_Group_Name": (
+                message.groupContext.currentName
+                if message.groupContext
+                else None
+            ),
         }
     )
 
@@ -341,7 +325,7 @@ def _route_whatsapp_sender_locked(
             # during Lead -> Contact conversion.
             # -------------------------------------------------
 
-            updated_history = append_history_to_lead(
+            append_history_to_lead(
                 lead,
                 message
             )
@@ -388,9 +372,8 @@ def _route_whatsapp_sender_locked(
                     "WhatsApp_Group_ID": message.chatId,
                     "WhatsApp_Group_Name": (
                         message.groupContext.currentName
-                    ),
-                    "WhatsApp_Conversation_History": (
-                        updated_history
+                        if message.groupContext
+                        else None
                     ),
                 }
             )

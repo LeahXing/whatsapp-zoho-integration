@@ -1174,3 +1174,126 @@ def update_whatsapp_message(
         message_record_id,
         record_data
     )
+
+# ============================================================
+# Create Zoho CRM Note
+# ============================================================
+
+def create_zoho_note(
+    module_name: str,
+    record_id: str,
+    note_title: str,
+    note_content: str
+):
+    """
+    Create a Note attached to a Zoho CRM record.
+
+    Supported modules:
+        Leads
+        Contacts
+        Deals
+    """
+
+    allowed_modules = {"Leads", "Contacts", "Deals"}
+
+    if module_name not in allowed_modules:
+        raise ValueError(
+            f"Unsupported Zoho module: {module_name}"
+        )
+
+    url = (
+        f"{ZOHO_API_DOMAIN}/crm/v8/"
+        f"{module_name}/{record_id}/Notes"
+    )
+
+    payload = {
+        "data": [
+            {
+                "Note_Title": note_title,
+                "Note_Content": note_content
+            }
+        ]
+    }
+
+    response = requests.post(
+        url,
+        headers=get_headers(),
+        json=payload,
+        timeout=30
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Failed to create Zoho Note. "
+            f"HTTP {response.status_code}: {response.text}"
+        )
+
+    result = response.json()
+    note_result = (result.get("data") or [{}])[0]
+
+    if note_result.get("status") != "success":
+        raise RuntimeError(
+            f"Zoho Note creation failed: {note_result}"
+        )
+
+    return note_result
+
+# ============================================================
+# Retrieve Notes for a Zoho CRM Record
+# ============================================================
+
+def get_zoho_notes(
+    module_name: str,
+    record_id: str
+) -> list:
+
+    allowed_modules = {"Leads", "Contacts", "Deals"}
+
+    if module_name not in allowed_modules:
+        raise ValueError(
+            f"Unsupported Zoho module: {module_name}"
+        )
+
+    url = (
+        f"{ZOHO_API_DOMAIN}/crm/v8/"
+        f"{module_name}/{record_id}/Notes"
+    )
+
+    all_notes = []
+    page = 1
+
+    while True:
+        response = requests.get(
+            url,
+            headers=get_headers(),
+            params={
+                "fields": "id,Note_Title,Note_Content,Created_Time,Modified_Time",
+                "page": page,
+                "per_page": 200
+            },
+            timeout=30
+        )
+
+        if response.status_code == 204:
+            break
+
+        if not response.ok:
+            raise RuntimeError(
+                f"Failed to retrieve Zoho Notes. "
+                f"HTTP {response.status_code}: {response.text}"
+            )
+
+        result = response.json()
+
+        all_notes.extend(
+            result.get("data", [])
+        )
+
+        if not result.get("info", {}).get(
+            "more_records", False
+        ):
+            break
+
+        page += 1
+
+    return all_notes
