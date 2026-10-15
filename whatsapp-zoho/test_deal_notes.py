@@ -52,15 +52,13 @@ def test_deal_notes():
     ):
         result = process_whatsapp_message(message)
 
-    assert mock_sync.call_count == 2
-    assert mock_sync.call_args_list[0].kwargs["module_name"] == "Contacts"
-    assert mock_sync.call_args_list[0].kwargs["record_id"] == "TEST-CONTACT-ID"
-    assert mock_sync.call_args_list[1].kwargs["module_name"] == "Deals"
-    assert mock_sync.call_args_list[1].kwargs["record_id"] == "TEST-DEAL-ID"
-    assert result["deal_notes"]["status"] == "created"
+    assert mock_sync.call_count == 1
+    assert mock_sync.call_args.kwargs["module_name"] == "Contacts"
+    assert mock_sync.call_args.kwargs["record_id"] == "TEST-CONTACT-ID"
+    assert result["deal_notes"]["status"] == "disabled"
 
-    print("PASS: Contact Notes synchronized.")
-    print("PASS: Deal Notes synchronized.")
+    print("PASS: Contact Note synchronized.")
+    print("PASS: No duplicate Deal Note created.")
     print("PASS: No real Zoho API calls were made.")
 
 

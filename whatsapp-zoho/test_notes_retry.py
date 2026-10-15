@@ -50,15 +50,12 @@ with (
     assert result["notes"]["status"] == "created"
     create_message.assert_not_called()
 
-    assert result["deal_notes"]["status"] == "created"
+    assert result["deal_notes"]["status"] == "disabled"
 
-    assert sync_note.call_count == 2
+    assert sync_note.call_count == 1
 
-    assert sync_note.call_args_list[0].kwargs["module_name"] == "Contacts"
-    assert sync_note.call_args_list[0].kwargs["record_id"] == "EXISTING-CONTACT-ID"
-
-    assert sync_note.call_args_list[1].kwargs["module_name"] == "Deals"
-    assert sync_note.call_args_list[1].kwargs["record_id"] == "EXISTING-DEAL-ID"
+    assert sync_note.call_args.kwargs["module_name"] == "Contacts"
+    assert sync_note.call_args.kwargs["record_id"] == "EXISTING-CONTACT-ID"
 
     print("PASS: Existing message was not recreated.")
     print("PASS: Notes synchronization was retried.")

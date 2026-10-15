@@ -265,33 +265,8 @@ def retry_existing_message_notes(message, existing_message):
             "error": str(exc),
         }
 
-    # Retry Deal Notes only when the message has a linked Deal.
-    deal_notes_result = {"status": "no_deal"}
-
-    if deal_id:
-        try:
-            deal_notes_result = sync_whatsapp_note(
-                module_name="Deals",
-                record_id=deal_id,
-                message_id=message.messageId,
-                sender_name=message.senderIdentity.pushName or "Unknown",
-                group_name=(
-                    message.groupContext.currentName
-                    if message.groupContext
-                    else "Unknown Group"
-                ),
-                timestamp=f"{message.displayDate} {message.displayTime}",
-                message_text=(
-                    message.messageContent.textContent or ""
-                    if message.messageContent
-                    else ""
-                ),
-            )
-        except Exception as exc:
-            deal_notes_result = {
-                "status": "failed",
-                "error": str(exc),
-            }
+    # Deal Note synchronization disabled to prevent duplicate Notes.
+    deal_notes_result = {"status": "disabled"}
 
     return {
         "status": "duplicate",
@@ -544,39 +519,8 @@ def process_whatsapp_message(
         }
 
     # --------------------------------------------------------
-    # 8A. Synchronize WhatsApp Message to Deal Notes
-    # --------------------------------------------------------
-
-    deal_notes_result = {"status": "no_deal"}
-
-    if deal_id:
-        try:
-            deal_notes_result = sync_whatsapp_note(
-                module_name="Deals",
-                record_id=deal_id,
-                message_id=message.messageId,
-                sender_name=(
-                    message.senderIdentity.pushName or "Unknown"
-                ),
-                group_name=(
-                    message.groupContext.currentName
-                    if message.groupContext
-                    else "Unknown Group"
-                ),
-                timestamp=(
-                    f"{message.displayDate} {message.displayTime}"
-                ),
-                message_text=(
-                    message.messageContent.textContent or ""
-                    if message.messageContent
-                    else ""
-                ),
-            )
-        except Exception as exc:
-            deal_notes_result = {
-                "status": "failed",
-                "error": str(exc),
-            }
+    # Deal Note synchronization disabled to prevent duplicate Notes.
+    deal_notes_result = {"status": "disabled"}
 
     # --------------------------------------------------------
     # 9. Return Complete Processing Result
