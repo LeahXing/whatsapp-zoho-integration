@@ -57,7 +57,20 @@ def sync_whatsapp_note(
             "status": "reconciliation_required",
             "note_id": sync_state["note_id"],
         }
-    note_title = f"{group_name} | {sender_name} | {timestamp}"
+    from datetime import datetime
+
+    normalized_timestamp = str(timestamp).strip()
+
+    for fmt in ("%Y-%m-%d %I:%M:%S %p", "%Y-%m-%d %H:%M:%S"):
+        try:
+            normalized_timestamp = datetime.strptime(
+                normalized_timestamp, fmt
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            break
+        except ValueError:
+            continue
+
+    note_title = f"{group_name} | {sender_name} | {normalized_timestamp}"
     note_content = message_text
     existing_notes = get_zoho_notes(
         module_name=module_name,

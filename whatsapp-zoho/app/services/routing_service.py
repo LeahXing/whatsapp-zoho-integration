@@ -257,10 +257,9 @@ def _route_whatsapp_sender_locked(
 
     whatsapp_id = message.senderIdentity.whatsappId
 
-    is_qualified = analysis.get(
-        "is_qualified",
-        False
-    )
+    # Automatic Lead conversion and qualification-based
+    # Contact creation are permanently disabled.
+    is_qualified = False
 
     # -----------------------------------------------------
     # 1. CONTACT has highest priority

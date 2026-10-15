@@ -873,48 +873,13 @@ def process_deal(
         }
 
     # --------------------------------------------------------
-    # 8. Create New Deal
+    # Automatic Deal creation permanently disabled.
+    # Existing Deal matching remains enabled.
     # --------------------------------------------------------
-
-    deal_data = build_deal_record(
-        message,
-        contact_id,
-        analysis,
-    )
-
-    created_deal = create_deal(
-        deal_data
-    )
-
-    deal_id = (
-        created_deal
-        .get("details", {})
-        .get("id")
-    )
-
-    if not deal_id:
-
-        raise RuntimeError(
-            "Zoho created the Deal but "
-            "did not return a Deal ID: "
-            f"{created_deal}"
-        )
-
-    # --------------------------------------------------------
-    # 8. Link WhatsApp Message -> New Deal
-    # --------------------------------------------------------
-
-    update_whatsapp_message(
-        whatsapp_message_record_id,
-        {
-            "Deal": {
-                "id": deal_id
-            }
-        }
-    )
 
     return {
-        "deal_action": "CREATE_NEW",
-        "deal_id": deal_id,
+        "deal_action": "MANUAL_REVIEW",
+        "reason": "Automatic Deal creation is disabled.",
+        "deal_id": None,
         "analysis": analysis,
     }
