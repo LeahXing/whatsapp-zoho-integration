@@ -2,6 +2,11 @@ import threading
 from typing import Optional
 
 from app.schemas.message_schema import WhatsAppMessageRequest
+from app.services.group_conversation_service import (
+    register_person_and_backfill,
+    transfer_lead_to_contact,
+)
+from app.storage.group_conversation_state import initialize_group_conversation_tables
 
 from app.repositories.zoho_repository import (
     ZohoDuplicateError,
@@ -242,11 +247,39 @@ def route_whatsapp_sender(
     whatsapp_id = message.senderIdentity.whatsappId
 
     with get_sender_lock(whatsapp_id):
-        return _route_whatsapp_sender_locked(
+        result = _route_whatsapp_sender_locked(
             message,
             whatsapp_message_record_id,
             analysis
         )
+
+        # Persist group membership only after Zoho sender routing succeeds.
+        # The first new Lead establishes the shared group conversation start.
+        person_type = result.get("person_type")
+        person_id = result.get("person_id")
+        if not message.chatId or not person_id or person_type not in ("lead", "contact"):
+            return result
+
+        initialize_group_conversation_tables()
+        timestamp = message.messageMeta.unixTimestamp if message.messageMeta else None
+        if result.get("converted") and result.get("source_lead_id"):
+            sync = transfer_lead_to_contact(
+                group_id=message.chatId,
+                lead_id=result["source_lead_id"],
+                contact_id=person_id,
+                whatsapp_id=whatsapp_id,
+            )
+        else:
+            sync = register_person_and_backfill(
+                group_id=message.chatId,
+                whatsapp_id=whatsapp_id,
+                module_name="Contacts" if person_type == "contact" else "Leads",
+                record_id=person_id,
+                first_lead_created=(result.get("action") == "LEAD_CREATED"),
+                triggering_timestamp=timestamp,
+            )
+        result["group_conversation"] = sync
+        return result
 
 
 def _route_whatsapp_sender_locked(

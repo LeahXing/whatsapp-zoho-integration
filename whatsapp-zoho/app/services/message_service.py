@@ -26,7 +26,13 @@ from app.services.media_service import (
 
 from datetime import datetime, timezone
 from app.storage.processing_state import enqueue_note
+from app.services.group_conversation_service import (
+    queue_group_message_notes,
+    register_person_and_backfill,
+    normalize_timestamp,
+)
 
+from app.services.timezone_service import format_dubai_timestamp
 # ============================================================
 # Build Zoho WhatsApp_Messages Record
 # ============================================================
@@ -202,48 +208,65 @@ def build_zoho_message_record(
 # Retry Notes for an Existing WhatsApp Message
 # ============================================================
 
-def _queue_notes(message, person_type, person_id, deal_id=None):
-    """Queue independent CRM Notes destinations; no Zoho Note API call in HTTP request."""
-    raw = message.messageMeta.unixTimestamp if message.messageMeta else None
-    if raw is None:
-        return ({"status":"skipped","reason":"Missing original Unix timestamp"},
-                {"status":"skipped","reason":"Missing original Unix timestamp"})
-    unix_time = float(raw)
-    if unix_time > 1e11:
-        unix_time /= 1000
-    # Original source timestamp determines chronological ordering.
-    dt = datetime.fromtimestamp(unix_time, tz=timezone.utc)
-    display_timestamp = dt.strftime('%Y-%m-%d %H:%M:%S') + ' UTC'
-    fields = dict(
-        message_id=message.messageId, group_id=message.chatId,
-        sender_name=message.senderIdentity.pushName or 'Unknown',
-        group_name=(message.groupContext.currentName if message.groupContext else None) or 'Unknown Group',
-        message_text=(message.messageContent.textContent if message.messageContent else None) or '',
-        unix_timestamp=unix_time, display_timestamp=display_timestamp,
-    )
-    person_result = {"status":"skipped","reason":"No Lead/Contact destination"}
-    deal_result = {"status":"skipped","reason":"No eligible Deal"}
-    if person_id and person_type in ('lead','contact'):
-        person_result = enqueue_note(module_name='Contacts' if person_type=='contact' else 'Leads',
-                                     record_id=person_id,**fields)
+def _queue_notes(message, person_type=None, person_id=None, deal_id=None):
+    """Queue shared Lead/Contact history and the matched Deal independently.
+
+    person_type/person_id are retained for compatibility with existing callers.
+    They no longer cause sender-only Notes to bypass the group start boundary.
+    """
+    person_result = queue_group_message_notes(message)
+    deal_result = {"status": "skipped", "reason": "No eligible Deal"}
+
     if deal_id:
-        deal_result = enqueue_note(module_name='Deals',record_id=deal_id,**fields)
+        raw = message.messageMeta.unixTimestamp if message.messageMeta else None
+        if raw is None:
+            deal_result = {"status": "skipped", "reason": "Missing original Unix timestamp"}
+        else:
+            unix_time = normalize_timestamp(raw)
+            dt = datetime.fromtimestamp(unix_time, tz=timezone.utc)
+            deal_result = enqueue_note(
+                message_id=message.messageId,
+                module_name="Deals",
+                record_id=deal_id,
+                group_id=message.chatId,
+                sender_name=message.senderIdentity.pushName or "Unknown",
+                group_name=(message.groupContext.currentName if message.groupContext else None) or "Unknown Group",
+                message_text=(message.messageContent.textContent if message.messageContent else None) or "",
+                unix_timestamp=unix_time,
+                display_timestamp=format_dubai_timestamp(dt.timestamp()),
+            )
     return person_result, deal_result
 
 
 def retry_existing_message_notes(message, existing_message):
-    """Duplicate ingestion: queue person Note once, never recreate a Deal association."""
+    """Repair person group membership/Notes on duplicate ingestion.
+
+    Never re-run Deal matching or create a Deal on duplicate delivery.
+    """
     whatsapp_id = message.senderIdentity.whatsappId
     contact = find_contact_by_whatsapp_id(whatsapp_id)
     lead = None if contact else find_lead_by_whatsapp_id(whatsapp_id)
-    person_type = 'contact' if contact else 'lead' if lead else None
-    person_id = (contact or lead or {}).get('id')
-    # Existing Deal lookup is intentionally NOT re-queued here: it may have closed.
-    notes, deal_notes = _queue_notes(message,person_type,person_id)
+    person_type = "contact" if contact else "lead" if lead else None
+    person_id = (contact or lead or {}).get("id")
+
+    recovery = {"status": "no_existing_person"}
+    if person_id and message.chatId:
+        recovery = register_person_and_backfill(
+            group_id=message.chatId,
+            whatsapp_id=whatsapp_id,
+            module_name="Contacts" if person_type == "contact" else "Leads",
+            record_id=person_id,
+        )
+
+    # Existing Deal lookup is intentionally NOT re-queued: it may have closed.
+    notes, deal_notes = _queue_notes(message, person_type, person_id)
     return {
-        'status':'duplicate','message_id':message.messageId,
-        'zoho_message_record_id':existing_message.get('id'),
-        'notes':notes,'deal_notes':deal_notes,
+        "status": "duplicate",
+        "message_id": message.messageId,
+        "zoho_message_record_id": existing_message.get("id"),
+        "group_conversation": recovery,
+        "notes": notes,
+        "deal_notes": deal_notes,
     }
 
 
@@ -492,6 +515,7 @@ def process_whatsapp_message(
                     "source_lead_id"
                 )
             ),
+            "group_conversation": routing_result.get("group_conversation"),
         },
 
         "deal": deal_result,

@@ -12,7 +12,7 @@ from app.repositories.deal_backfill_repository import (
     find_group_messages_for_backfill,
 )
 from app.storage.processing_state import enqueue_note
-
+from app.services.timezone_service import format_dubai_timestamp
 
 def _utc(value):
     """Convert Unix seconds/milliseconds or timezone-aware ISO strings to UTC."""
@@ -120,7 +120,7 @@ def preview_or_backfill(deal_id: str, dry_run: bool = True):
             group_name=message.get("Group_Name") or "Unknown Group",
             message_text=message.get("Message") or "",
             unix_timestamp=when.timestamp(),
-            display_timestamp=when.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            display_timestamp=format_dubai_timestamp(when.timestamp()),
         )
         queued.append({"message_id": mid, **result})
 
