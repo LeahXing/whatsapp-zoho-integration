@@ -24,9 +24,8 @@ from app.services.media_service import (
     upload_media_to_zoho,
 )
 
-from app.services.note_service import (
-    sync_whatsapp_note,
-)
+from datetime import datetime, timezone
+from app.storage.processing_state import enqueue_note
 
 # ============================================================
 # Build Zoho WhatsApp_Messages Record
@@ -203,78 +202,50 @@ def build_zoho_message_record(
 # Retry Notes for an Existing WhatsApp Message
 # ============================================================
 
-def retry_existing_message_notes(message, existing_message):
-    """
-    Retry Notes synchronization for a WhatsApp message
-    that already exists in Zoho CRM.
-    """
-
-    whatsapp_id = message.senderIdentity.whatsappId
-    # Retrieve the Deal already linked to this WhatsApp message.
-    # Do not create or search for another Deal.
-
-    deal_lookup = existing_message.get("Deal")
-
-    deal_id = (
-        deal_lookup.get("id")
-        if isinstance(deal_lookup, dict)
-        else None
+def _queue_notes(message, person_type, person_id, deal_id=None):
+    """Queue independent CRM Notes destinations; no Zoho Note API call in HTTP request."""
+    raw = message.messageMeta.unixTimestamp if message.messageMeta else None
+    if raw is None:
+        return ({"status":"skipped","reason":"Missing original Unix timestamp"},
+                {"status":"skipped","reason":"Missing original Unix timestamp"})
+    unix_time = float(raw)
+    if unix_time > 1e11:
+        unix_time /= 1000
+    # Original source timestamp determines chronological ordering.
+    dt = datetime.fromtimestamp(unix_time, tz=timezone.utc)
+    display_timestamp = dt.strftime('%Y-%m-%d %H:%M:%S') + ' UTC'
+    fields = dict(
+        message_id=message.messageId, group_id=message.chatId,
+        sender_name=message.senderIdentity.pushName or 'Unknown',
+        group_name=(message.groupContext.currentName if message.groupContext else None) or 'Unknown Group',
+        message_text=(message.messageContent.textContent if message.messageContent else None) or '',
+        unix_timestamp=unix_time, display_timestamp=display_timestamp,
     )
+    person_result = {"status":"skipped","reason":"No Lead/Contact destination"}
+    deal_result = {"status":"skipped","reason":"No eligible Deal"}
+    if person_id and person_type in ('lead','contact'):
+        person_result = enqueue_note(module_name='Contacts' if person_type=='contact' else 'Leads',
+                                     record_id=person_id,**fields)
+    if deal_id:
+        deal_result = enqueue_note(module_name='Deals',record_id=deal_id,**fields)
+    return person_result, deal_result
 
+
+def retry_existing_message_notes(message, existing_message):
+    """Duplicate ingestion: queue person Note once, never recreate a Deal association."""
+    whatsapp_id = message.senderIdentity.whatsappId
     contact = find_contact_by_whatsapp_id(whatsapp_id)
     lead = None if contact else find_lead_by_whatsapp_id(whatsapp_id)
-
-    if contact:
-        module_name = "Contacts"
-        person_id = contact.get("id")
-    elif lead:
-        module_name = "Leads"
-        person_id = lead.get("id")
-    else:
-        return {
-            "status": "duplicate",
-            "message_id": message.messageId,
-            "zoho_message_record_id": existing_message.get("id"),
-            "notes": {
-                "status": "skipped",
-                "reason": "No matching Contact or Lead found.",
-            },
-        }
-
-    try:
-        notes_result = sync_whatsapp_note(
-            module_name=module_name,
-            record_id=person_id,
-            message_id=message.messageId,
-            sender_name=message.senderIdentity.pushName or "Unknown",
-            group_name=(
-                message.groupContext.currentName
-                if message.groupContext
-                else "Unknown Group"
-            ),
-            timestamp=f"{message.displayDate} {message.displayTime}",
-            message_text=(
-                message.messageContent.textContent or ""
-                if message.messageContent
-                else ""
-            ),
-        )
-    except Exception as exc:
-        notes_result = {
-            "status": "failed",
-            "error": str(exc),
-        }
-
-    # Deal Note synchronization disabled to prevent duplicate Notes.
-    deal_notes_result = {"status": "disabled"}
-
+    person_type = 'contact' if contact else 'lead' if lead else None
+    person_id = (contact or lead or {}).get('id')
+    # Existing Deal lookup is intentionally NOT re-queued here: it may have closed.
+    notes, deal_notes = _queue_notes(message,person_type,person_id)
     return {
-        "status": "duplicate",
-        "message_id": message.messageId,
-        "zoho_message_record_id": existing_message.get("id"),
-        "notes": notes_result,
-        "deal_notes": deal_notes_result,
+        'status':'duplicate','message_id':message.messageId,
+        'zoho_message_record_id':existing_message.get('id'),
+        'notes':notes,'deal_notes':deal_notes,
     }
+
 
 # ============================================================
 # Process Incoming WhatsApp Message
@@ -374,19 +345,8 @@ def process_whatsapp_message(
     # 4. Analyze Message BEFORE Person Routing
     # --------------------------------------------------------
     #
-    # Qualification determines:
-    #
-    # Existing Lead + unqualified
-    #     -> remain Lead
-    #
-    # Existing Lead + qualified
-    #     -> convert Lead -> Contact
-    #
-    # New sender + unqualified
-    #     -> create Lead
-    #
-    # New sender + qualified
-    #     -> create Contact
+    # Analysis is retained for reporting only.
+    # Lead conversion and Deal creation remain manual in Zoho.
     # --------------------------------------------------------
 
     analysis = analyze_commercial_message(
@@ -487,40 +447,12 @@ def process_whatsapp_message(
     )
 
     # --------------------------------------------------------
-    # 8. Synchronize WhatsApp Message to Zoho Notes
+    # 8. Queue Notes for background synchronization (10 seconds)
     # --------------------------------------------------------
-
-    try:
-        notes_result = sync_whatsapp_note(
-            module_name=(
-                "Contacts" if person_type == "contact"
-                else "Leads"
-            ),
-            record_id=person_id,
-            message_id=message.messageId,
-            sender_name=message.senderIdentity.pushName or "Unknown",
-            group_name=(
-                message.groupContext.currentName
-                if message.groupContext
-                else "Unknown Group"
-            ),
-            timestamp=f"{message.displayDate} {message.displayTime}",
-            message_text=(
-                message.messageContent.textContent or ""
-                if message.messageContent
-                else ""
-            ),
-        )
-
-    except Exception as exc:
-        notes_result = {
-            "status": "failed",
-            "error": str(exc),
-        }
-
-    # --------------------------------------------------------
-    # Deal Note synchronization disabled to prevent duplicate Notes.
-    deal_notes_result = {"status": "disabled"}
+    notes_result, deal_notes_result = _queue_notes(
+        message=message, person_type=person_type, person_id=person_id,
+        deal_id=deal_id,
+    )
 
     # --------------------------------------------------------
     # 9. Return Complete Processing Result

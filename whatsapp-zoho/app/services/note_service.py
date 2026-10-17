@@ -1,158 +1,55 @@
-# ============================================================
-# WhatsApp -> Zoho CRM Notes Synchronization
-# ============================================================
+"""Idempotent WhatsApp -> Zoho Note synchronization."""
+from datetime import datetime
+from app.repositories.zoho_repository import create_zoho_note, get_zoho_notes
+from app.storage.processing_state import get_note_sync_state, save_note_sync_state, claim_note_sync
 
-from app.repositories.zoho_repository import (
-    create_zoho_note,
-    get_zoho_notes,
-)
 
-from app.storage.processing_state import (
-    get_note_sync_state,
-    save_note_sync_state,
-    claim_note_sync,
-)
+def sync_whatsapp_note(module_name: str, record_id: str, message_id: str,
+                       sender_name: str, group_name: str, timestamp: str,
+                       message_text: str) -> dict:
+    if not message_id or not record_id:
+        raise ValueError('message_id and record_id are required')
+    state = get_note_sync_state(message_id,module_name,record_id)
+    if state and state['sync_status'] == 'completed':
+        return {'status':'already_synced','note_id':state['note_id']}
 
-def sync_whatsapp_note(
-    module_name: str,
-    record_id: str,
-    message_id: str,
-    sender_name: str,
-    group_name: str,
-    timestamp: str,
-    message_text: str,
-) -> dict:
-    """
-    Create a Zoho Note for one WhatsApp message.
-
-    Prevent duplicates by checking the Message_ID
-    in existing Notes for the destination CRM record.
-    """
-
-    if not message_id:
-        raise ValueError("message_id is required.")
-
-    if not record_id:
-        raise ValueError("record_id is required.")
-    
-    # Check whether this WhatsApp message has already
-    # been synchronized to this Zoho CRM record.
-    sync_state = get_note_sync_state(
-        message_id=message_id,
-        module_name=module_name,
-        record_id=record_id,
-    )
-
-    if sync_state and sync_state["sync_status"] == "completed":
-        return {
-            "status": "already_synced",
-            "note_id": sync_state["note_id"],
-        }
-
-    # An earlier request may have created a Zoho Note
-    # before its Note ID was saved locally.
-    # Do not automatically create another Note.
-    if sync_state and sync_state["sync_status"] == "pending":
-        return {
-            "status": "reconciliation_required",
-            "note_id": sync_state["note_id"],
-        }
-    from datetime import datetime
-
-    normalized_timestamp = str(timestamp).strip()
-
-    for fmt in ("%Y-%m-%d %I:%M:%S %p", "%Y-%m-%d %H:%M:%S"):
+    normalized = str(timestamp or '').strip()
+    for fmt in ('%Y-%m-%d %I:%M:%S %p','%Y-%m-%d %H:%M:%S'):
         try:
-            normalized_timestamp = datetime.strptime(
-                normalized_timestamp, fmt
-            ).strftime("%Y-%m-%d %H:%M:%S")
+            normalized = datetime.strptime(normalized,fmt).strftime('%Y-%m-%d %H:%M:%S')
             break
         except ValueError:
-            continue
+            pass
+    title = f'{group_name} | {sender_name} | {normalized}'
+    marker = f'WhatsApp Message ID: {message_id}'
+    content = f'{message_text or ""}\n\n{marker}'
 
-    note_title = f"{group_name} | {sender_name} | {normalized_timestamp}"
-    note_content = message_text
-    existing_notes = get_zoho_notes(
-        module_name=module_name,
-        record_id=record_id,
-    )
-
-    marker = f"WhatsApp Message ID: {message_id}"
-
-    for note in existing_notes:
-        if marker in (note.get("Note_Content") or ""):
-
-            existing_note_id = note.get("id")
-
-            if not existing_note_id:
-                raise ValueError(
-                    "Existing Zoho Note is missing its Note ID."
-                )
-
-            save_note_sync_state(
-                message_id=message_id,
-                module_name=module_name,
-                record_id=record_id,
-                note_id=existing_note_id,
-                sync_status="completed",
-            )
-
-            return {
-                "status": "already_synced",
-                "note_id": existing_note_id,
-            }
-
-    clean_matches = [
-        note for note in existing_notes
-        if note.get("Note_Title") == note_title
-        and note.get("Note_Content") == note_content
-    ]
-
-    if clean_matches:
-        return {
-            "status": "reconciliation_required",
-            "note_id": (
-                clean_matches[0].get("id")
-                if len(clean_matches) == 1
-                else None
-            ),
-        }
-
-    # Clean Zoho Note format
-    # Atomically claim synchronization before creating the Note.
-    claimed = claim_note_sync(
-        message_id=message_id,
-        module_name=module_name,
-        record_id=record_id,
-    )
-
-    if not claimed:
-        # Another request may already be processing this message.
-        # Do not create another Zoho Note.
-        return {
-            "status": "reconciliation_required",
-            "note_id": None,
-        }
-
-    result = create_zoho_note(
-        module_name=module_name,
-        record_id=record_id,
-        note_title=note_title,
-        note_content=note_content,
-    )
-
-    # Save the Zoho Note ID after successful creation.
-    note_id = result["details"]["id"]
-
-    save_note_sync_state(
-        message_id=message_id,
-        module_name=module_name,
-        record_id=record_id,
-        note_id=note_id,
-        sync_status="completed",
-    )
-
-    return {
-        "status": "created",
-        "note_id": note_id,
-    }
+    # Reconcile with Zoho first, including a legacy note without marker.
+    notes = get_zoho_notes(module_name=module_name,record_id=record_id)
+    matches = [n for n in notes if marker in (n.get('Note_Content') or '')]
+    if len(matches) == 1 and matches[0].get('id'):
+        note_id = matches[0]['id']
+        save_note_sync_state(message_id,module_name,record_id,note_id,'completed')
+        return {'status':'already_synced','note_id':note_id}
+    if len(matches) > 1:
+        return {'status':'reconciliation_required','note_id':None,
+                'reason':'Multiple Zoho Notes contain the same message marker'}
+    legacy = [n for n in notes if n.get('Note_Title') == title and
+              n.get('Note_Content') == (message_text or '')]
+    if legacy:
+        return {'status':'reconciliation_required',
+                'note_id':legacy[0].get('id') if len(legacy)==1 else None,
+                'reason':'Legacy Note without Message ID marker; review manually'}
+    if state and state['sync_status'] == 'pending':
+        return {'status':'reconciliation_required','note_id':state.get('note_id'),
+                'reason':'Prior claim exists; Zoho creation outcome may be uncertain'}
+    if not claim_note_sync(message_id,module_name,record_id):
+        return {'status':'reconciliation_required','note_id':None}
+    # Once claimed, failures are uncertain; do not automatically retry create.
+    result = create_zoho_note(module_name=module_name,record_id=record_id,
+                              note_title=title,note_content=content)
+    note_id = result.get('details',{}).get('id')
+    if not note_id:
+        raise RuntimeError('Zoho Note create returned no ID; reconciliation required')
+    save_note_sync_state(message_id,module_name,record_id,note_id,'completed')
+    return {'status':'created','note_id':note_id}

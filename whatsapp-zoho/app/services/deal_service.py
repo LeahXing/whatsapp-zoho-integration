@@ -1,14 +1,11 @@
 import re
+from datetime import datetime, timezone
 from typing import Optional
 
 from app.schemas.message_schema import WhatsAppMessageRequest
 
 from app.repositories.zoho_repository import (
     find_active_deals_by_contact,
-    find_whatsapp_messages_by_deal_id,
-    find_whatsapp_message_by_message_id,
-    create_deal,
-    update_deal,
     update_whatsapp_message,
 )
 
@@ -467,213 +464,83 @@ def detect_commercial_intent(
 
 
 # ============================================================
-# Find Matching Existing Deal
+# Manual Deal routing: conversation windows, not commodity intent
 # ============================================================
 
-def find_matching_deal(
-    active_deals: list,
-    commodity: Optional[str],
-) -> Optional[dict]:
-    """
-    Match an existing active Deal by commodity.
+CLOSED_STAGES = {"closed won", "closed lost"}
 
-    Return a Deal only when exactly one match exists.
-    Raise ValueError when multiple Deals match.
-    """
 
-    if not commodity:
+def _utc_datetime(value):
+    """Parse Zoho Date/Time or WhatsApp Unix time into aware UTC datetime.
+
+    Unix seconds and milliseconds are supported. Naive Date/Time values are
+    rejected: they must carry an explicit offset to prevent wrong matches.
+    """
+    if value is None or value == "":
         return None
+    if isinstance(value, (int, float)) or (
+        isinstance(value, str) and value.strip().replace(".", "", 1).isdigit()
+    ):
+        number = float(value)
+        if number > 1e11:  # milliseconds
+            number /= 1000
+        return datetime.fromtimestamp(number, tz=timezone.utc)
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    else:
+        raise ValueError(f"Unsupported timestamp type: {type(value).__name__}")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("Date/Time must include a timezone offset")
+    return parsed.astimezone(timezone.utc)
 
-    matches = [
-        deal
-        for deal in active_deals
-        if (
-            deal.get("Commodity")
-            and str(deal["Commodity"]).strip().lower()
-            == commodity.strip().lower()
-        )
-    ]
 
-    if len(matches) == 1:
-        return matches[0]
+def _lookup_id(value):
+    return str(value.get("id")) if isinstance(value, dict) and value.get("id") else None
 
+
+def _is_closed(deal):
+    return str(deal.get("Stage") or "").strip().lower() in CLOSED_STAGES
+
+
+def _within_window(message_time, deal):
+    start = _utc_datetime(deal.get("WhatsApp_Conversation_Start"))
+    end = _utc_datetime(deal.get("WhatsApp_Conversation_End"))
+    if start is None:
+        return False  # explicit start is mandatory
+    if end is not None and end < start:
+        raise ValueError("Deal conversation End precedes Start")
+    return start <= message_time and (end is None or message_time <= end)
+
+
+def find_matching_deal(active_deals, contact_id, group_id, message_time):
+    """Return the unique open Deal in the message's inclusive time window.
+
+    A candidate must match Contact, group, active flag, and open Stage.
+    Ambiguous or malformed windows are not silently accepted.
+    """
+    matches = []
+    for deal in active_deals:
+        if _lookup_id(deal.get("Contact_Name")) != str(contact_id):
+            continue
+        if str(deal.get("WhatsApp_Group_ID") or "") != str(group_id):
+            continue
+        if deal.get("WhatsApp_Active_Deal") is not True or _is_closed(deal):
+            continue
+        try:
+            in_window = _within_window(message_time, deal)
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise ValueError(f"INVALID_DEAL_WINDOW for Deal {deal.get('id')}: {exc}") from exc
+        if in_window:
+            matches.append(deal)
     if len(matches) > 1:
         raise ValueError(
-            "AMBIGUOUS_DEAL_MATCH: Multiple active Deals "
-            f"match commodity '{commodity}'. "
-            "Manual Deal selection is required."
+            "AMBIGUOUS_DEAL_MATCH: Multiple open Deals match Contact, "
+            "WhatsApp group and message timestamp. Resolve overlapping windows in Zoho."
         )
+    return matches[0] if matches else None
 
-    return None
-
-
-
-def find_reply_matching_deal(
-    message: WhatsAppMessageRequest,
-    contact_id: str,
-    active_deals: list,
-) -> Optional[dict]:
-    """
-    Resolve a WhatsApp reply to an existing active Deal.
-
-    Never guess when the original message or Deal
-    cannot be verified.
-    """
-    thread = message.threadContext
-    reply_id = thread.replyToMessageId if thread else None
-
-    if not reply_id:
-        return None
-
-    original = find_whatsapp_message_by_message_id(reply_id)
-
-    if not original:
-        raise ValueError(
-            "UNRESOLVED_REPLY: Original WhatsApp message not found."
-        )
-
-    if str(original.get("Group_ID")) != str(message.chatId):
-        raise ValueError(
-            "UNRESOLVED_REPLY: Original message belongs to another group."
-        )
-
-    deal_lookup = original.get("Deal")
-    deal_id = (
-        deal_lookup.get("id")
-        if isinstance(deal_lookup, dict)
-        else None
-    )
-
-    if not deal_id:
-        raise ValueError(
-            "UNRESOLVED_REPLY: Original message has no linked Deal."
-        )
-
-    matches = [
-        deal for deal in active_deals
-        if (
-            str(deal.get("id")) == str(deal_id)
-            and deal.get("WhatsApp_Active_Deal") is True
-            and isinstance(deal.get("Contact_Name"), dict)
-            and str(deal["Contact_Name"].get("id")) == str(contact_id)
-            and str(deal.get("WhatsApp_Group_ID")) == str(message.chatId)
-        )
-    ]
-
-    if len(matches) != 1:
-        raise ValueError(
-            "UNRESOLVED_REPLY: Referenced Deal is not uniquely verified "
-            "as active and belonging to this Contact and group."
-        )
-
-    return matches[0]
-
-
-# ============================================================
-# Build New Deal Record
-# ============================================================
-
-def build_deal_record(
-    message: WhatsAppMessageRequest,
-    contact_id: str,
-    analysis: dict,
-) -> dict:
-    """
-    Build a new Zoho Deal record.
-    """
-
-    commodity = analysis.get(
-        "commodity"
-    )
-
-    quantity = analysis.get(
-        "quantity"
-    )
-
-    price = analysis.get(
-        "price"
-    )
-
-    group_name = (
-        message.groupContext.currentName
-        if message.groupContext
-        else None
-    )
-
-    # Deal Name must exist in Zoho.
-
-    deal_name_parts = [
-        commodity or "WhatsApp Deal",
-        message.senderIdentity.pushName
-        or message.senderIdentity.whatsappId,
-    ]
-
-    deal_name = " - ".join(
-        deal_name_parts
-    )
-
-    record = {
-
-        "Deal_Name": deal_name,
-
-        "Contact_Name": {
-            "id": contact_id
-        },
-
-        "Commodity": commodity,
-        "Quantity": quantity,
-        "Price": price,
-
-        "Stage": "Qualification",
-
-        "WhatsApp_Group_ID": (
-            message.chatId
-        ),
-
-        "WhatsApp_Group_Name": (
-            group_name
-        ),
-
-        "WhatsApp_Active_Deal": True,
-    }
-
-    return {
-        key: value
-        for key, value in record.items()
-        if value is not None
-    }
-
-
-# ============================================================
-# Update Existing Deal Group Information
-# ============================================================
-
-def append_history_to_deal(
-    deal: dict,
-    message: WhatsAppMessageRequest
-) -> None:
-    """
-    Update Deal group information without writing
-    conversation history to the old CRM field.
-    """
-
-    deal_id = deal["id"]
-
-    update_deal(
-        deal_id,
-        {
-            "WhatsApp_Group_ID": message.chatId,
-            "WhatsApp_Group_Name": (
-                message.groupContext.currentName
-                if message.groupContext
-                else None
-            ),
-        }
-    )
-
-# ============================================================
-# Process Deal Routing
-# ============================================================
 
 def process_deal(
     message: WhatsAppMessageRequest,
@@ -681,205 +548,49 @@ def process_deal(
     contact_id: Optional[str],
     analysis: Optional[dict] = None,
 ) -> dict:
+    """Link a message to an existing manually created Deal; never create one.
+
+    A message's original WhatsApp timestamp controls inclusion. Closed Deals
+    are excluded from live routing, even for delayed messages; a separate
+    historical backfill service will handle closed-Deal windows.
     """
-    Determine whether the incoming WhatsApp message should
-    be associated with a Deal.
-
-    Business rules:
-
-        - Deal requires a Contact.
-        - Message must represent a qualified commercial enquiry.
-        - Existing active Deal is matched by commodity.
-        - Matching Deal receives appended conversation history.
-        - Otherwise a new Deal is created.
-    """
-
-    # --------------------------------------------------------
-    # 1. Deal requires Contact
-    # --------------------------------------------------------
-
-    if not contact_id:
-
-        return {
-            "deal_action": "NO_DEAL",
-            "reason": (
-                "Sender is not a Contact."
-            ),
-            "deal_id": None,
-        }
-
-    # --------------------------------------------------------
-    # 2. Use existing analysis when provided
-    # --------------------------------------------------------
-
     if analysis is None:
-
-        analysis = (
-            analyze_commercial_message(
-                message
-            )
-        )
-
-    # --------------------------------------------------------
-    # 3. No commercial intent
-    # --------------------------------------------------------
-
-    # Prioritize explicit WhatsApp replies.
-    thread = message.threadContext
-    reply_id = thread.replyToMessageId if thread else None
-
-    if reply_id:
-        active_deals = find_active_deals_by_contact(contact_id)
-
-        try:
-            matching_deal = find_reply_matching_deal(
-                message,
-                contact_id,
-                active_deals,
-            )
-        except ValueError as exc:
-            return {
-                "deal_action": "MANUAL_REVIEW",
-                "reason": str(exc),
-                "deal_id": None,
-                "analysis": analysis,
-            }
-
-        if matching_deal:
-            deal_id = matching_deal["id"]
-
-            append_history_to_deal(matching_deal, message)
-
-            update_whatsapp_message(
-                whatsapp_message_record_id,
-                {"Deal": {"id": deal_id}},
-            )
-
-            return {
-                "deal_action": "LINK_EXISTING",
-                "deal_id": deal_id,
-                "match_method": "WHATSAPP_REPLY",
-                "analysis": analysis,
-            }
-
-    if not analysis.get(
-        "is_commercial"
-    ):
-
+        analysis = analyze_commercial_message(message)
+    if not contact_id:
         return {
-            "deal_action": "NO_DEAL",
-            "reason": (
-                "No commercial intent detected."
-            ),
-            "deal_id": None,
-            "analysis": analysis,
+            "deal_action": "NO_DEAL", "reason": "Sender is not a Contact.",
+            "deal_id": None, "analysis": analysis,
         }
-
-    # --------------------------------------------------------
-    # 4. Commercial but not qualified
-    # --------------------------------------------------------
-
-    if not analysis.get(
-        "is_qualified"
-    ):
-
-        return {
-            "deal_action": "NO_DEAL",
-            "reason": (
-                "Commercial intent detected, "
-                "but message is not sufficiently "
-                "qualified for Deal routing."
-            ),
-            "deal_id": None,
-            "analysis": analysis,
-        }
-
-    # --------------------------------------------------------
-    # 5. Get Active Deals for Contact
-    # --------------------------------------------------------
-
-    active_deals = (
-        find_active_deals_by_contact(
-            contact_id
-        )
-    )
-
-    # --------------------------------------------------------
-    # 6. Try to Match Existing Deal
-    # --------------------------------------------------------
-
     try:
-        matching_deal = find_matching_deal(
-            active_deals,
-            analysis.get("commodity"),
+        meta = message.messageMeta
+        raw_time = meta.unixTimestamp if meta else None
+        if raw_time is None:
+            raise ValueError("Original WhatsApp Unix timestamp is missing")
+        message_time = _utc_datetime(raw_time)
+        if message_time is None:
+            raise ValueError("Original WhatsApp Unix timestamp is missing")
+        active_deals = find_active_deals_by_contact(contact_id)
+        matching = find_matching_deal(
+            active_deals, contact_id, message.chatId, message_time
         )
-    except ValueError as exc:
-        if "AMBIGUOUS_DEAL_MATCH" not in str(exc):
-            raise
-
+    except (ValueError, TypeError, OverflowError) as exc:
         return {
-            "deal_action": "MANUAL_REVIEW",
-            "reason": str(exc),
-            "deal_id": None,
-            "analysis": analysis,
+            "deal_action": "MANUAL_REVIEW", "reason": str(exc),
+            "deal_id": None, "analysis": analysis,
         }
 
-    if matching_deal:
-
-        deal_id = matching_deal["id"]
-
-        # Append message to transaction-specific
-        # Deal conversation history.
-
-        append_history_to_deal(
-            matching_deal,
-            message
-        )
-
-        # Link WhatsApp Message -> existing Deal.
-
-        update_whatsapp_message(
-            whatsapp_message_record_id,
-            {
-                "Deal": {
-                    "id": deal_id
-                }
-            }
-        )
-
+    if matching is None:
         return {
-            "deal_action": (
-                "LINK_EXISTING"
-            ),
-            "deal_id": deal_id,
-            "analysis": analysis,
+            "deal_action": "NO_DEAL",
+            "reason": "No eligible manually created open Deal matches Contact, group and conversation window.",
+            "deal_id": None, "analysis": analysis,
         }
 
-    # --------------------------------------------------------
-    # 7. Prevent new Deals from follow-up messages
-    # --------------------------------------------------------
-
-    message_type = analysis.get("message_type")
-
-    if message_type in {"NEGOTIATION", "CONFIRMATION"}:
-        return {
-            "deal_action": "MANUAL_REVIEW",
-            "reason": (
-                f"{message_type} message has no matching active Deal. "
-                "Manual Deal selection is required."
-            ),
-            "deal_id": None,
-            "analysis": analysis,
-        }
-
-    # --------------------------------------------------------
-    # Automatic Deal creation permanently disabled.
-    # Existing Deal matching remains enabled.
-    # --------------------------------------------------------
-
+    deal_id = matching["id"]
+    update_whatsapp_message(
+        whatsapp_message_record_id, {"Deal": {"id": deal_id}}
+    )
     return {
-        "deal_action": "MANUAL_REVIEW",
-        "reason": "Automatic Deal creation is disabled.",
-        "deal_id": None,
-        "analysis": analysis,
+        "deal_action": "LINK_EXISTING", "deal_id": deal_id,
+        "match_method": "CONTACT_GROUP_TIME_WINDOW", "analysis": analysis,
     }
